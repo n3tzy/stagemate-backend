@@ -103,6 +103,22 @@ def check_username(request: Request, username: str, db: Session = Depends(get_db
     return {"available": exists is None}
 
 
+@app.get("/auth/check-displayname")
+@limiter.limit("20/minute")
+def check_displayname(request: Request, display_name: str, db: Session = Depends(get_db)):
+    """닉네임 중복 확인"""
+    exists = db.query(db_models.User).filter(db_models.User.display_name == display_name).first()
+    return {"available": exists is None}
+
+
+@app.get("/auth/check-email")
+@limiter.limit("20/minute")
+def check_email(request: Request, email: str, db: Session = Depends(get_db)):
+    """이메일 중복 확인"""
+    exists = db.query(db_models.User).filter(db_models.User.email == email).first()
+    return {"available": exists is None}
+
+
 @app.post("/auth/register")
 @limiter.limit("5/minute")
 def register(request: Request, req: RegisterRequest, db: Session = Depends(get_db)):
