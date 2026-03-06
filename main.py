@@ -683,6 +683,9 @@ def delete_notice(
     ).first()
     if not notice:
         raise HTTPException(status_code=404, detail="공지사항을 찾을 수 없습니다.")
+    # 임원진(admin)은 본인 작성 공지만 삭제 가능 / 회장(super_admin)은 모두 삭제 가능
+    if member.role == "admin" and notice.author_id != member.user_id:
+        raise HTTPException(status_code=403, detail="본인이 작성한 공지사항만 삭제할 수 있습니다.")
     db.delete(notice)
     db.commit()
     return {"message": "삭제 완료!"}
