@@ -1,6 +1,7 @@
 import logging
 import secrets
 import string
+import httpx
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -26,6 +27,7 @@ from models import (
     RegisterRequest, ClubCreateRequest, ClubJoinRequest,
     RoleUpdateRequest, NoticeRequest, SlotRequest,
     ChangePasswordRequest, ForgotPasswordRequest,
+    KakaoLoginRequest, CommentRequest,
 )
 from scheduler import calculate_schedule
 from group_schedule import find_common_slots_from_db
@@ -91,6 +93,19 @@ async def generic_exception_handler(request: Request, exc: Exception):
     )
 
 
+# ── DB 마이그레이션 (kakao_id 컬럼 자동 추가) ────────
+@app.on_event("startup")
+async def run_migrations():
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN kakao_id VARCHAR UNIQUE"))
+            conn.commit()
+            logger.info("Migration: kakao_id column added")
+    except Exception:
+        pass  # 이미 존재하면 무시
+
+
 # ════════════════════════════════════════════════
 #  인증 (Auth)
 # ════════════════════════════════════════════════
@@ -154,6 +169,54 @@ def register(request: Request, req: RegisterRequest, db: Session = Depends(get_d
     logger.info(f"New user registered: {user.username}")
     return {
         "message": f"회원가입 완료! 환영해요, {user.display_name}님 🎉",
+        "user_id": user.id,
+    }
+
+
+@app.post("/auth/kakao")
+@limiter.limit("10/minute")
+async def kakao_login(request: Request, req: KakaoLoginRequest, db: Session = Depends(get_db)):
+    """카카오 소셜 로그인 — 카카오 액세스 토큰으로 사용자 인증"""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://kapi.kakao.com/v2/user/me",
+            headers={"Authorization": f"Bearer {req.access_token}"},
+            timeout=10.0,
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail="카카오 인증에 실패했습니다.")
+
+    kakao_data = resp.json()
+    kakao_id = str(kakao_data["id"])
+    profile = kakao_data.get("kakao_account", {}).get("profile", {})
+    nickname = profile.get("nickname") or f"user_{kakao_id[:6]}"
+
+    user = db.query(db_models.User).filter(db_models.User.kakao_id == kakao_id).first()
+    if not user:
+        username = f"kakao_{kakao_id}"
+        display_name = nickname
+        counter = 1
+        temp = display_name
+        while db.query(db_models.User).filter(db_models.User.display_name == temp).first():
+            temp = f"{display_name}_{counter}"
+            counter += 1
+        display_name = temp
+
+        user = db_models.User(
+            username=username,
+            display_name=display_name,
+            kakao_id=kakao_id,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        logger.info(f"New kakao user: {user.username}")
+
+    token = create_access_token({"sub": user.username, "uid": user.id})
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "display_name": user.display_name,
         "user_id": user.id,
     }
 
@@ -689,6 +752,82 @@ def delete_notice(
     db.delete(notice)
     db.commit()
     return {"message": "삭제 완료!"}
+
+
+# ── 공지사항 댓글 ─────────────────────────────────
+@app.get("/notices/{notice_id}/comments")
+def get_comments(
+    notice_id: int,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_member)
+):
+    notice = db.query(db_models.Notice).filter(
+        db_models.Notice.id == notice_id,
+        db_models.Notice.club_id == member.club_id
+    ).first()
+    if not notice:
+        raise HTTPException(status_code=404, detail="공지사항을 찾을 수 없습니다.")
+    return [
+        {
+            "id": c.id,
+            "author": c.author.display_name,
+            "author_id": c.author_id,
+            "content": c.content,
+            "created_at": c.created_at.strftime("%Y-%m-%d %H:%M"),
+        }
+        for c in notice.comments
+    ]
+
+
+@app.post("/notices/{notice_id}/comments")
+def create_comment(
+    notice_id: int,
+    req: CommentRequest,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_member)
+):
+    notice = db.query(db_models.Notice).filter(
+        db_models.Notice.id == notice_id,
+        db_models.Notice.club_id == member.club_id
+    ).first()
+    if not notice:
+        raise HTTPException(status_code=404, detail="공지사항을 찾을 수 없습니다.")
+    comment = db_models.NoticeComment(
+        notice_id=notice_id,
+        author_id=member.user_id,
+        content=req.content,
+    )
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return {
+        "id": comment.id,
+        "author": comment.author.display_name,
+        "author_id": comment.author_id,
+        "content": comment.content,
+        "created_at": comment.created_at.strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+@app.delete("/notices/{notice_id}/comments/{comment_id}")
+def delete_comment(
+    notice_id: int,
+    comment_id: int,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_member)
+):
+    comment = db.query(db_models.NoticeComment).filter(
+        db_models.NoticeComment.id == comment_id,
+        db_models.NoticeComment.notice_id == notice_id,
+    ).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="댓글을 찾을 수 없습니다.")
+    # 본인 댓글 또는 회장/임원진만 삭제 가능
+    if comment.author_id != member.user_id and member.role not in ("admin", "super_admin"):
+        raise HTTPException(status_code=403, detail="삭제 권한이 없습니다.")
+    db.delete(comment)
+    db.commit()
+    return {"message": "댓글이 삭제됐습니다."}
 
 
 # ════════════════════════════════════════════════

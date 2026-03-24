@@ -45,6 +45,9 @@ class User(Base):
     email = Column(String, nullable=True, unique=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    # ── 소셜 로그인 ─────────────────────────────
+    kakao_id = Column(String, unique=True, nullable=True, index=True)
+
     # ── 로그인 실패 잠금 ────────────────────────
     failed_login_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime, nullable=True)  # None = 잠금 없음
@@ -101,3 +104,18 @@ class Notice(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     author = relationship("User", back_populates="notices")
+    comments = relationship("NoticeComment", back_populates="notice", cascade="all, delete-orphan")
+
+
+# ── 공지사항 댓글 테이블 ──────────────────────────
+class NoticeComment(Base):
+    __tablename__ = "notice_comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    notice_id = Column(Integer, ForeignKey("notices.id"), nullable=False)
+    author_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    notice = relationship("Notice", back_populates="comments")
+    author = relationship("User")

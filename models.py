@@ -6,6 +6,10 @@ from typing import List, Literal
 # 인증 관련 모델 (입력 검증 강화)
 # ───────────────────────────────
 
+class KakaoLoginRequest(BaseModel):
+    access_token: str
+
+
 class RegisterRequest(BaseModel):
     username: str = Field(
         ..., min_length=3, max_length=20,
@@ -56,6 +60,17 @@ class ClubJoinRequest(BaseModel):
 class NoticeRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=100)
     content: str = Field(..., min_length=1, max_length=5000)
+
+
+class CommentRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=500)
+
+    @field_validator('content')
+    @classmethod
+    def no_script_tags(cls, v: str) -> str:
+        if re.search(r'<script', v, re.IGNORECASE):
+            raise ValueError('스크립트 태그는 허용되지 않습니다.')
+        return v.strip()
 
     @field_validator('title', 'content')
     @classmethod
