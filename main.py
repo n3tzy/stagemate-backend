@@ -28,11 +28,12 @@ from models import (
     RoleUpdateRequest, NoticeRequest, SlotRequest,
     ChangePasswordRequest, ForgotPasswordRequest,
     KakaoLoginRequest, CommentRequest,
+    DeleteAccountRequest, PostRequest, PostCommentRequest,
 )
 from scheduler import calculate_schedule
 from group_schedule import find_common_slots_from_db
 from room_booking_db import add_booking_db, get_bookings_db, delete_booking_db
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ── 로깅 설정 ──────────────────────────────────────
 logging.basicConfig(
@@ -105,6 +106,18 @@ async def run_migrations():
     except Exception:
         pass  # 이미 존재하면 무시
 
+    # deleted_at, reregister_allowed_at 컬럼 추가
+    for col_def in [
+        "ALTER TABLE users ADD COLUMN deleted_at TIMESTAMP",
+        "ALTER TABLE users ADD COLUMN reregister_allowed_at TIMESTAMP",
+    ]:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(col_def))
+                conn.commit()
+        except Exception:
+            pass  # 이미 존재하면 무시
+
 
 # ════════════════════════════════════════════════
 #  인증 (Auth)
@@ -151,8 +164,25 @@ def register(request: Request, req: RegisterRequest, db: Session = Depends(get_d
     if existing:
         raise HTTPException(status_code=400, detail="이미 존재하는 아이디입니다.")
 
-    if db.query(db_models.User).filter(db_models.User.email == req.email).first():
+    if db.query(db_models.User).filter(
+        db_models.User.email == req.email,
+        db_models.User.deleted_at == None,
+    ).first():
         raise HTTPException(status_code=400, detail="이미 사용 중인 이메일입니다.")
+
+    # 탈퇴 후 7일 재가입 쿨다운 체크
+    deleted_user = db.query(db_models.User).filter(
+        db_models.User.email == req.email,
+        db_models.User.deleted_at != None,
+    ).first()
+    if deleted_user and deleted_user.reregister_allowed_at:
+        now = datetime.utcnow()
+        if deleted_user.reregister_allowed_at > now:
+            days_left = (deleted_user.reregister_allowed_at - now).days + 1
+            raise HTTPException(
+                status_code=400,
+                detail=f"탈퇴 후 {days_left}일 후에 재가입할 수 있습니다.",
+            )
 
     if db.query(db_models.User).filter(db_models.User.display_name == req.display_name).first():
         raise HTTPException(status_code=400, detail="이미 사용 중인 닉네임입니다.")
@@ -236,6 +266,10 @@ def login(
     # 사용자 미존재 → 동일 오류 메시지 (사용자 열거 공격 방지)
     if not user:
         raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 틀렸습니다.")
+
+    # 탈퇴된 계정 확인
+    if user.deleted_at is not None:
+        raise HTTPException(status_code=401, detail="탈퇴된 계정입니다.")
 
     # 계정 잠금 확인 (5회 실패 시 15분 잠금)
     check_account_lock(user)
@@ -362,20 +396,28 @@ async def forgot_password(
 
 @app.delete("/auth/me")
 def delete_account(
+    req: DeleteAccountRequest,
     db: Session = Depends(get_db),
     current_user: db_models.User = Depends(get_current_user),
 ):
-    """계정 탈퇴 — 관련 데이터 모두 삭제"""
-    uid = current_user.id
-    username = current_user.username
-    db.query(db_models.AvailabilitySlot).filter(db_models.AvailabilitySlot.user_id == uid).delete()
-    db.query(db_models.RoomBookingDB).filter(db_models.RoomBookingDB.user_id == uid).delete()
-    db.query(db_models.Notice).filter(db_models.Notice.author_id == uid).delete()
-    db.query(db_models.ClubMember).filter(db_models.ClubMember.user_id == uid).delete()
-    db.delete(current_user)
+    """회원 탈퇴 - 비밀번호 확인 후 소프트 삭제, 7일 재가입 쿨다운"""
+    is_kakao_user = current_user.kakao_id is not None and current_user.hashed_password is None
+
+    if is_kakao_user:
+        if req.confirm_text != "탈퇴합니다":
+            raise HTTPException(status_code=400, detail="'탈퇴합니다'를 정확히 입력해주세요.")
+    else:
+        if not req.password:
+            raise HTTPException(status_code=400, detail="비밀번호를 입력해주세요.")
+        if not verify_password(req.password, current_user.hashed_password):
+            raise HTTPException(status_code=400, detail="비밀번호가 일치하지 않습니다.")
+
+    now = datetime.utcnow()
+    current_user.deleted_at = now
+    current_user.reregister_allowed_at = now + timedelta(days=7)
     db.commit()
-    logger.info(f"Account deleted: {username}")
-    return {"message": "계정이 삭제됐습니다."}
+    logger.info(f"User soft-deleted: {current_user.username}")
+    return {"message": "탈퇴가 완료됐습니다. 7일 후 재가입이 가능합니다."}
 
 
 # ════════════════════════════════════════════════
@@ -947,3 +989,331 @@ def cancel_booking(
     member: db_models.ClubMember = Depends(require_any_member)
 ):
     return delete_booking_db(booking_id, member.user_id, member.club_id, db)
+
+
+# ════════════════════════════════════════════════
+#  게시판 (Posts)
+# ════════════════════════════════════════════════
+
+@app.post("/posts")
+@limiter.limit("20/minute")
+def create_post(
+    request: Request,
+    req: PostRequest,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """게시글 작성 (동아리 피드 or 전체 채널)"""
+    post = db_models.Post(
+        club_id=member.club_id if not req.is_global else None,
+        author_id=member.user_id,
+        content=req.content,
+        media_urls=req.media_urls,
+        is_global=req.is_global,
+    )
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return {"id": post.id, "message": "게시글이 등록됐습니다."}
+
+
+@app.get("/posts")
+def get_posts(
+    is_global: bool = False,
+    offset: int = 0,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """게시글 목록 조회 (동아리 피드 or 전체 채널, 최신순)"""
+    query = db.query(db_models.Post)
+    if is_global:
+        query = query.filter(db_models.Post.is_global == True)
+    else:
+        query = query.filter(
+            db_models.Post.club_id == member.club_id,
+            db_models.Post.is_global == False,
+        )
+    posts = query.order_by(db_models.Post.created_at.desc()).offset(offset).limit(limit).all()
+
+    result = []
+    for p in posts:
+        author = db.query(db_models.User).filter(db_models.User.id == p.author_id).first()
+        like_count = db.query(db_models.PostLike).filter(db_models.PostLike.post_id == p.id).count()
+        comment_count = db.query(db_models.PostComment).filter(db_models.PostComment.post_id == p.id).count()
+        my_liked = db.query(db_models.PostLike).filter(
+            db_models.PostLike.post_id == p.id,
+            db_models.PostLike.user_id == member.user_id,
+        ).first() is not None
+        result.append({
+            "id": p.id,
+            "author": author.display_name if author else "탈퇴한 사용자",
+            "author_id": p.author_id,
+            "content": p.content,
+            "media_urls": p.media_urls or [],
+            "like_count": like_count,
+            "comment_count": comment_count,
+            "my_liked": my_liked,
+            "is_global": p.is_global,
+            "created_at": p.created_at.strftime("%Y.%m.%d %H:%M") if p.created_at else "",
+        })
+    return result
+
+
+@app.delete("/posts/{post_id}")
+def delete_post(
+    post_id: int,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """게시글 삭제 (본인 or admin/super_admin)"""
+    post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="게시글을 찾을 수 없습니다.")
+    is_owner = post.author_id == member.user_id
+    is_admin = member.role in ("admin", "super_admin")
+    if not (is_owner or is_admin):
+        raise HTTPException(status_code=403, detail="삭제 권한이 없습니다.")
+    db.delete(post)
+    db.commit()
+    return {"message": "삭제됐습니다."}
+
+
+@app.post("/posts/{post_id}/likes")
+def toggle_like(
+    post_id: int,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """좋아요 토글 (없으면 추가, 있으면 취소)"""
+    post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="게시글을 찾을 수 없습니다.")
+    existing = db.query(db_models.PostLike).filter(
+        db_models.PostLike.post_id == post_id,
+        db_models.PostLike.user_id == member.user_id,
+    ).first()
+    if existing:
+        db.delete(existing)
+        db.commit()
+        liked = False
+    else:
+        db.add(db_models.PostLike(post_id=post_id, user_id=member.user_id))
+        db.commit()
+        liked = True
+    like_count = db.query(db_models.PostLike).filter(db_models.PostLike.post_id == post_id).count()
+    return {"liked": liked, "like_count": like_count}
+
+
+@app.get("/posts/{post_id}/comments")
+def get_post_comments(
+    post_id: int,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """게시글 댓글 목록"""
+    comments = db.query(db_models.PostComment).filter(
+        db_models.PostComment.post_id == post_id
+    ).order_by(db_models.PostComment.created_at.asc()).all()
+    result = []
+    for c in comments:
+        author = db.query(db_models.User).filter(db_models.User.id == c.author_id).first()
+        result.append({
+            "id": c.id,
+            "author": author.display_name if author else "탈퇴한 사용자",
+            "author_id": c.author_id,
+            "content": c.content,
+            "created_at": c.created_at.strftime("%Y.%m.%d %H:%M") if c.created_at else "",
+        })
+    return result
+
+
+@app.post("/posts/{post_id}/comments")
+@limiter.limit("30/minute")
+def create_post_comment(
+    request: Request,
+    post_id: int,
+    req: PostCommentRequest,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """게시글 댓글 작성"""
+    post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="게시글을 찾을 수 없습니다.")
+    comment = db_models.PostComment(
+        post_id=post_id,
+        author_id=member.user_id,
+        content=req.content,
+    )
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    author = db.query(db_models.User).filter(db_models.User.id == member.user_id).first()
+    return {
+        "id": comment.id,
+        "author": author.display_name if author else "",
+        "content": comment.content,
+        "created_at": comment.created_at.strftime("%Y.%m.%d %H:%M") if comment.created_at else "",
+    }
+
+
+@app.delete("/posts/{post_id}/comments/{comment_id}")
+def delete_post_comment(
+    post_id: int,
+    comment_id: int,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """게시글 댓글 삭제 (본인 or admin/super_admin)"""
+    comment = db.query(db_models.PostComment).filter(
+        db_models.PostComment.id == comment_id,
+        db_models.PostComment.post_id == post_id,
+    ).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="댓글을 찾을 수 없습니다.")
+    is_owner = comment.author_id == member.user_id
+    is_admin = member.role in ("admin", "super_admin")
+    if not (is_owner or is_admin):
+        raise HTTPException(status_code=403, detail="삭제 권한이 없습니다.")
+    db.delete(comment)
+    db.commit()
+    return {"message": "삭제됐습니다."}
+
+
+# ════════════════════════════════════════════════
+#  핫 동아리 순위
+# ════════════════════════════════════════════════
+
+@app.get("/clubs/hot-ranking")
+def get_hot_clubs(
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """최근 7일간 게시글+댓글 수 기준 핫 동아리 순위 (전체 채널 기준)"""
+    from sqlalchemy import func
+    cutoff = datetime.utcnow() - timedelta(days=7)
+
+    # 전체 채널 게시글 기준으로 동아리별 활동량 집계
+    # post의 author_id → ClubMember → club_id
+    post_counts = (
+        db.query(db_models.ClubMember.club_id, func.count(db_models.Post.id).label("cnt"))
+        .join(db_models.Post, db_models.Post.author_id == db_models.ClubMember.user_id)
+        .filter(db_models.Post.created_at >= cutoff, db_models.Post.is_global == True)
+        .group_by(db_models.ClubMember.club_id)
+        .all()
+    )
+    comment_counts = (
+        db.query(db_models.ClubMember.club_id, func.count(db_models.PostComment.id).label("cnt"))
+        .join(db_models.PostComment, db_models.PostComment.author_id == db_models.ClubMember.user_id)
+        .filter(db_models.PostComment.created_at >= cutoff)
+        .group_by(db_models.ClubMember.club_id)
+        .all()
+    )
+
+    scores: dict[int, int] = {}
+    for club_id, cnt in post_counts:
+        scores[club_id] = scores.get(club_id, 0) + cnt * 2  # 게시글은 가중치 2
+    for club_id, cnt in comment_counts:
+        scores[club_id] = scores.get(club_id, 0) + cnt
+
+    if not scores:
+        return []
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:10]
+    result = []
+    for rank, (club_id, score) in enumerate(ranked, 1):
+        club = db.query(db_models.Club).filter(db_models.Club.id == club_id).first()
+        if club:
+            result.append({"rank": rank, "club_name": club.name, "score": score})
+    return result
+
+
+# ════════════════════════════════════════════════
+#  내 활동 조회
+# ════════════════════════════════════════════════
+
+@app.get("/users/me/activity")
+def get_my_activity(
+    db: Session = Depends(get_db),
+    current_user: db_models.User = Depends(get_current_user),
+):
+    """내가 쓴 게시글 + 댓글 목록"""
+    posts = (
+        db.query(db_models.Post)
+        .filter(db_models.Post.author_id == current_user.id)
+        .order_by(db_models.Post.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    post_list = []
+    for p in posts:
+        like_count = db.query(db_models.PostLike).filter(db_models.PostLike.post_id == p.id).count()
+        comment_count = db.query(db_models.PostComment).filter(db_models.PostComment.post_id == p.id).count()
+        post_list.append({
+            "id": p.id,
+            "content": p.content,
+            "media_urls": p.media_urls or [],
+            "like_count": like_count,
+            "comment_count": comment_count,
+            "is_global": p.is_global,
+            "created_at": p.created_at.strftime("%Y.%m.%d %H:%M") if p.created_at else "",
+        })
+
+    comments = (
+        db.query(db_models.PostComment)
+        .filter(db_models.PostComment.author_id == current_user.id)
+        .order_by(db_models.PostComment.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    comment_list = []
+    for c in comments:
+        post = db.query(db_models.Post).filter(db_models.Post.id == c.post_id).first()
+        comment_list.append({
+            "id": c.id,
+            "content": c.content,
+            "post_id": c.post_id,
+            "post_preview": (post.content[:50] + "...") if post and len(post.content) > 50 else (post.content if post else "삭제된 게시글"),
+            "created_at": c.created_at.strftime("%Y.%m.%d %H:%M") if c.created_at else "",
+        })
+
+    return {"posts": post_list, "comments": comment_list}
+
+
+# ════════════════════════════════════════════════
+#  미디어 업로드 (Cloudflare R2 Presigned URL)
+# ════════════════════════════════════════════════
+
+@app.get("/upload/presigned")
+def get_presigned_url(
+    filename: str,
+    content_type: str = "image/jpeg",
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """R2 presigned upload URL 발급 (R2 설정이 없으면 503 반환)"""
+    if not settings.R2_ACCESS_KEY_ID or not settings.R2_BUCKET_NAME:
+        raise HTTPException(
+            status_code=503,
+            detail="미디어 업로드 서비스가 아직 설정되지 않았습니다. 관리자에게 문의하세요.",
+        )
+    import boto3
+    from botocore.config import Config
+    import uuid
+
+    key = f"posts/{uuid.uuid4()}/{filename}"
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=settings.R2_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.R2_ACCESS_KEY_SECRET,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
+    presigned = s3.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": settings.R2_BUCKET_NAME, "Key": key, "ContentType": content_type},
+        ExpiresIn=300,  # 5분
+    )
+    public_url = f"{settings.R2_PUBLIC_URL}/{key}" if settings.R2_PUBLIC_URL else ""
+    return {"upload_url": presigned, "public_url": public_url, "key": key}

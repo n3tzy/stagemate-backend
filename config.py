@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     MAIL_SERVER: str = "smtp.gmail.com"
     MAIL_PORT: int = 587
 
+    # ── 카카오 로그인 ──────────────────────────────────────
+    KAKAO_REST_API_KEY: str = ""
+
+    # ── Cloudflare R2 (S3 호환 스토리지) ─────────────────────
+    R2_ACCOUNT_ID: str = ""
+    R2_ACCESS_KEY_ID: str = ""
+    R2_ACCESS_KEY_SECRET: str = ""
+    R2_BUCKET_NAME: str = "stagemate-media"
+    R2_PUBLIC_URL: str = ""   # 예: https://pub-xxxx.r2.dev
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, UniqueConstraint, Boolean
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, UniqueConstraint, Boolean, Text, JSON
 from sqlalchemy.orm import relationship
 from database import Base
 from datetime import datetime
@@ -52,10 +52,15 @@ class User(Base):
     failed_login_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime, nullable=True)  # None = 잠금 없음
 
+    # ── 소프트 삭제 (탈퇴) ──────────────────────
+    deleted_at = Column(DateTime, nullable=True)            # 탈퇴 시각 (소프트 삭제)
+    reregister_allowed_at = Column(DateTime, nullable=True)  # 재가입 허용 시각 (탈퇴 후 7일)
+
     memberships = relationship("ClubMember", back_populates="user")
     availability_slots = relationship("AvailabilitySlot", back_populates="user")
     bookings = relationship("RoomBookingDB", back_populates="user")
     notices = relationship("Notice", back_populates="author")
+    posts = relationship("Post", foreign_keys="Post.author_id")
 
 
 # ── 가능 시간 슬롯 테이블 ─────────────────────────
@@ -118,4 +123,40 @@ class NoticeComment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     notice = relationship("Notice", back_populates="comments")
+    author = relationship("User")
+
+
+# ── 자유게시판 / 전체채널 게시글 ──────────────────────
+class Post(Base):
+    __tablename__ = "posts"
+    id = Column(Integer, primary_key=True, index=True)
+    club_id = Column(Integer, ForeignKey("clubs.id"), nullable=True)  # None이면 전체 채널
+    author_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content = Column(Text, nullable=False)
+    media_urls = Column(JSON, default=list)   # 이미지/영상 URL 목록
+    is_global = Column(Boolean, default=False, nullable=False)  # True=전체채널
+    created_at = Column(DateTime, default=datetime.utcnow)
+    author = relationship("User")
+    likes = relationship("PostLike", back_populates="post", cascade="all, delete-orphan")
+    comments = relationship("PostComment", back_populates="post", cascade="all, delete-orphan")
+
+
+class PostLike(Base):
+    __tablename__ = "post_likes"
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    post = relationship("Post", back_populates="likes")
+    __table_args__ = (UniqueConstraint("post_id", "user_id", name="uq_post_like"),)
+
+
+class PostComment(Base):
+    __tablename__ = "post_comments"
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False)
+    author_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    post = relationship("Post", back_populates="comments")
     author = relationship("User")

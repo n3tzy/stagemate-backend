@@ -61,6 +61,14 @@ class NoticeRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=100)
     content: str = Field(..., min_length=1, max_length=5000)
 
+    @field_validator('title', 'content')
+    @classmethod
+    def no_script_tags(cls, v: str) -> str:
+        # <script> 태그 삽입 방지
+        if re.search(r'<script', v, re.IGNORECASE):
+            raise ValueError('스크립트 태그는 허용되지 않습니다.')
+        return v
+
 
 class CommentRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=500)
@@ -72,13 +80,35 @@ class CommentRequest(BaseModel):
             raise ValueError('스크립트 태그는 허용되지 않습니다.')
         return v.strip()
 
-    @field_validator('title', 'content')
+
+class DeleteAccountRequest(BaseModel):
+    """탈퇴 시 비밀번호 or 확인 텍스트"""
+    password: str | None = None          # 일반 계정: 비밀번호 필수
+    confirm_text: str | None = None       # 카카오 계정: "탈퇴합니다" 텍스트
+
+
+class PostRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=2000)
+    media_urls: list[str] = Field(default_factory=list, max_length=5)
+    is_global: bool = False
+
+    @field_validator('content')
     @classmethod
     def no_script_tags(cls, v: str) -> str:
-        # <script> 태그 삽입 방지
         if re.search(r'<script', v, re.IGNORECASE):
             raise ValueError('스크립트 태그는 허용되지 않습니다.')
-        return v
+        return v.strip()
+
+
+class PostCommentRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=500)
+
+    @field_validator('content')
+    @classmethod
+    def no_script_tags(cls, v: str) -> str:
+        if re.search(r'<script', v, re.IGNORECASE):
+            raise ValueError('스크립트 태그는 허용되지 않습니다.')
+        return v.strip()
 
 
 class RoleUpdateRequest(BaseModel):
