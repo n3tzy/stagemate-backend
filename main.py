@@ -801,7 +801,7 @@ def delete_notice(
 def get_comments(
     notice_id: int,
     db: Session = Depends(get_db),
-    member: db_models.ClubMember = Depends(require_member)
+    member: db_models.ClubMember = Depends(require_any_member)
 ):
     notice = db.query(db_models.Notice).filter(
         db_models.Notice.id == notice_id,
@@ -826,7 +826,7 @@ def create_comment(
     notice_id: int,
     req: CommentRequest,
     db: Session = Depends(get_db),
-    member: db_models.ClubMember = Depends(require_member)
+    member: db_models.ClubMember = Depends(require_any_member)
 ):
     notice = db.query(db_models.Notice).filter(
         db_models.Notice.id == notice_id,
@@ -856,7 +856,7 @@ def delete_comment(
     notice_id: int,
     comment_id: int,
     db: Session = Depends(get_db),
-    member: db_models.ClubMember = Depends(require_member)
+    member: db_models.ClubMember = Depends(require_any_member)
 ):
     comment = db.query(db_models.NoticeComment).filter(
         db_models.NoticeComment.id == comment_id,
