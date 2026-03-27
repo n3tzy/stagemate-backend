@@ -91,6 +91,7 @@ class PostRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=2000)
     media_urls: list[str] = Field(default_factory=list, max_length=5)
     is_global: bool = False
+    is_anonymous: bool = False  # True면 "익명"으로 게시
 
     @field_validator('content')
     @classmethod
@@ -98,6 +99,18 @@ class PostRequest(BaseModel):
         if re.search(r'<script', v, re.IGNORECASE):
             raise ValueError('스크립트 태그는 허용되지 않습니다.')
         return v.strip()
+
+
+class NicknameRequest(BaseModel):
+    nickname: str = Field(..., min_length=1, max_length=20)
+
+    @field_validator('nickname')
+    @classmethod
+    def validate_nickname(cls, v: str) -> str:
+        v = v.strip()
+        if re.search(r'<script', v, re.IGNORECASE):
+            raise ValueError('스크립트 태그는 허용되지 않습니다.')
+        return v
 
 
 class PostCommentRequest(BaseModel):

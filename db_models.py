@@ -52,6 +52,9 @@ class User(Base):
     failed_login_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime, nullable=True)  # None = 잠금 없음
 
+    # ── 닉네임 (전체 커뮤니티용) ─────────────────
+    nickname = Column(String, nullable=True, unique=True)   # 전체 커뮤니티에서 사용할 닉네임
+
     # ── 소프트 삭제 (탈퇴) ──────────────────────
     deleted_at = Column(DateTime, nullable=True)            # 탈퇴 시각 (소프트 삭제)
     reregister_allowed_at = Column(DateTime, nullable=True)  # 재가입 허용 시각 (탈퇴 후 7일)
@@ -135,6 +138,9 @@ class Post(Base):
     content = Column(Text, nullable=False)
     media_urls = Column(JSON, default=list)   # 이미지/영상 URL 목록
     is_global = Column(Boolean, default=False, nullable=False)  # True=전체채널
+    view_count = Column(Integer, default=0, nullable=False)     # 조회수
+    post_author_name = Column(String, nullable=True)             # None=실명, "익명"=익명, 닉네임=닉네임
+    is_anonymous = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     author = relationship("User")
     likes = relationship("PostLike", back_populates="post", cascade="all, delete-orphan")

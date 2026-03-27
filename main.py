@@ -28,7 +28,7 @@ from models import (
     RoleUpdateRequest, NoticeRequest, SlotRequest,
     ChangePasswordRequest, ForgotPasswordRequest,
     KakaoLoginRequest, CommentRequest,
-    DeleteAccountRequest, PostRequest, PostCommentRequest,
+    DeleteAccountRequest, PostRequest, PostCommentRequest, NicknameRequest,
 )
 from scheduler import calculate_schedule
 from group_schedule import find_common_slots_from_db
@@ -106,10 +106,14 @@ async def run_migrations():
     except Exception:
         pass  # 이미 존재하면 무시
 
-    # deleted_at, reregister_allowed_at 컬럼 추가
+    # 추가 컬럼 마이그레이션
     for col_def in [
         "ALTER TABLE users ADD COLUMN deleted_at TIMESTAMP",
         "ALTER TABLE users ADD COLUMN reregister_allowed_at TIMESTAMP",
+        "ALTER TABLE users ADD COLUMN nickname VARCHAR UNIQUE",
+        "ALTER TABLE posts ADD COLUMN view_count INTEGER DEFAULT 0",
+        "ALTER TABLE posts ADD COLUMN post_author_name VARCHAR",
+        "ALTER TABLE posts ADD COLUMN is_anonymous BOOLEAN DEFAULT FALSE",
     ]:
         try:
             with engine.connect() as conn:
@@ -300,7 +304,30 @@ def get_me(current_user: db_models.User = Depends(get_current_user)):
         "user_id": current_user.id,
         "username": current_user.username,
         "display_name": current_user.display_name,
+        "nickname": current_user.nickname or "",
     }
+
+
+@app.patch("/auth/nickname")
+@limiter.limit("10/minute")
+def update_nickname(
+    request: Request,
+    req: NicknameRequest,
+    db: Session = Depends(get_db),
+    current_user: db_models.User = Depends(get_current_user),
+):
+    """닉네임 설정/변경 (전체 커뮤니티용)"""
+    # 중복 확인
+    existing = db.query(db_models.User).filter(
+        db_models.User.nickname == req.nickname,
+        db_models.User.id != current_user.id,
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="이미 사용 중인 닉네임입니다.")
+    current_user.nickname = req.nickname
+    db.commit()
+    logger.info(f"Nickname updated: {current_user.username} → {req.nickname}")
+    return {"message": "닉네임이 설정됐습니다.", "nickname": req.nickname}
 
 
 @app.patch("/auth/change-password")
@@ -1004,12 +1031,25 @@ def create_post(
     member: db_models.ClubMember = Depends(require_any_member),
 ):
     """게시글 작성 (동아리 피드 or 전체 채널)"""
+    author = db.query(db_models.User).filter(db_models.User.id == member.user_id).first()
+    # 전체 커뮤니티: 익명 or 닉네임 / 동아리: 항상 실명
+    if req.is_global:
+        if req.is_anonymous:
+            post_author_name = "익명"
+        else:
+            post_author_name = (author.nickname if author and author.nickname else None)
+    else:
+        post_author_name = None  # 실명 사용 (author.display_name)
+
     post = db_models.Post(
         club_id=member.club_id if not req.is_global else None,
         author_id=member.user_id,
         content=req.content,
         media_urls=req.media_urls,
         is_global=req.is_global,
+        is_anonymous=req.is_anonymous,
+        post_author_name=post_author_name,
+        view_count=0,
     )
     db.add(post)
     db.commit()
@@ -1045,14 +1085,18 @@ def get_posts(
             db_models.PostLike.post_id == p.id,
             db_models.PostLike.user_id == member.user_id,
         ).first() is not None
+        # 표시 이름: post_author_name 우선, 없으면 실명
+        display_author = p.post_author_name or (author.display_name if author else "탈퇴한 사용자")
         result.append({
             "id": p.id,
-            "author": author.display_name if author else "탈퇴한 사용자",
+            "author": display_author,
             "author_id": p.author_id,
+            "is_anonymous": p.is_anonymous or False,
             "content": p.content,
             "media_urls": p.media_urls or [],
             "like_count": like_count,
             "comment_count": comment_count,
+            "view_count": p.view_count or 0,
             "my_liked": my_liked,
             "is_global": p.is_global,
             "created_at": p.created_at.strftime("%Y.%m.%d %H:%M") if p.created_at else "",
@@ -1111,7 +1155,11 @@ def get_post_comments(
     db: Session = Depends(get_db),
     member: db_models.ClubMember = Depends(require_any_member),
 ):
-    """게시글 댓글 목록"""
+    """게시글 댓글 목록 (조회 시 view_count +1)"""
+    post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
+    if post:
+        post.view_count = (post.view_count or 0) + 1
+        db.commit()
     comments = db.query(db_models.PostComment).filter(
         db_models.PostComment.post_id == post_id
     ).order_by(db_models.PostComment.created_at.asc()).all()
