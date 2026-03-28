@@ -1537,6 +1537,7 @@ def get_post_comments(
 @limiter.limit("30/minute")
 def create_post_comment(
     request: Request,
+    background_tasks: BackgroundTasks,
     post_id: int,
     req: PostCommentRequest,
     db: Session = Depends(get_db),
@@ -1568,6 +1569,14 @@ def create_post_comment(
         )
         db.add(notif)
         db.commit()
+        # FCM 푸시 (백그라운드, 논블로킹)
+        background_tasks.add_task(
+            _send_push,
+            post.author.fcm_token or "",   # lazy-loaded via Post.author relationship (one extra query, acceptable per spec)
+            "새 댓글",
+            f"{actor_name}님이 댓글을 남겼어요: {preview}",
+            post_id,
+        )
 
     return {
         "id": comment.id,
@@ -2201,6 +2210,18 @@ def get_hot_clubs(
         if club:
             result.append({"rank": rank, "club_id": club.id, "club_name": club.name, "score": score})
     return result
+
+
+@app.patch("/users/me/fcm-token")
+def update_fcm_token(
+    req: FcmTokenRequest,
+    current_user: db_models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """FCM 디바이스 토큰 등록/갱신"""
+    current_user.fcm_token = req.token
+    db.commit()
+    return {"ok": True}
 
 
 # ════════════════════════════════════════════════
