@@ -1534,6 +1534,48 @@ def delete_post_comment(
     return {"message": "삭제됐습니다."}
 
 
+@app.post("/posts/{post_id}/comments/{comment_id}/like")
+@limiter.limit("60/minute")
+def toggle_comment_like(
+    request: Request,
+    post_id: int,
+    comment_id: int,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """댓글 좋아요 토글 (like ↔ unlike)"""
+    comment = db.query(db_models.PostComment).filter(
+        db_models.PostComment.id == comment_id,
+        db_models.PostComment.post_id == post_id,
+    ).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="댓글을 찾을 수 없습니다.")
+
+    post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
+    if not post or (not post.is_global and post.club_id != member.club_id):
+        raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
+
+    existing = db.query(db_models.CommentLike).filter(
+        db_models.CommentLike.comment_id == comment_id,
+        db_models.CommentLike.user_id == member.user_id,
+    ).first()
+
+    if existing:
+        db.delete(existing)
+        db.commit()
+        liked = False
+    else:
+        db.add(db_models.CommentLike(comment_id=comment_id, user_id=member.user_id))
+        db.commit()
+        liked = True
+
+    like_count = db.query(db_models.CommentLike).filter(
+        db_models.CommentLike.comment_id == comment_id
+    ).count()
+
+    return {"liked": liked, "like_count": like_count}
+
+
 # ── 게시글 수정 ──────────────────────────────────────
 @app.patch("/posts/{post_id}")
 @limiter.limit("20/minute")
