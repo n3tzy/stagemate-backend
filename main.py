@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy import desc, nulls_last, text
+from sqlalchemy import desc, nulls_last, text, func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from database import engine, get_db
@@ -1447,6 +1447,37 @@ def get_post_comments(
     comments = db.query(db_models.PostComment).filter(
         db_models.PostComment.post_id == post_id
     ).order_by(db_models.PostComment.created_at.asc()).all()
+
+    # ── 좋아요 집계 (N+1 방지: 한 번에 조회) ──────────────
+    comment_ids = [c.id for c in comments]
+    if comment_ids:
+        like_counts = dict(
+            db.query(db_models.CommentLike.comment_id, func.count(db_models.CommentLike.id))
+            .filter(db_models.CommentLike.comment_id.in_(comment_ids))
+            .group_by(db_models.CommentLike.comment_id)
+            .all()
+        )
+        my_likes = set(
+            row[0] for row in
+            db.query(db_models.CommentLike.comment_id)
+            .filter(
+                db_models.CommentLike.comment_id.in_(comment_ids),
+                db_models.CommentLike.user_id == member.user_id,
+            )
+            .all()
+        )
+    else:
+        like_counts, my_likes = {}, set()
+
+    # ── 베스트 댓글 결정 (좋아요 최다, 최소 1개, 동점 시 먼저 작성된 댓글) ──
+    best_comment_id = None
+    max_likes = 0
+    for c in comments:  # already ordered by created_at asc → first encountered wins ties
+        count = like_counts.get(c.id, 0)
+        if count > max_likes:
+            max_likes = count
+            best_comment_id = c.id
+
     result = []
     for c in comments:
         author = db.query(db_models.User).filter(db_models.User.id == c.author_id).first()
@@ -1461,6 +1492,9 @@ def get_post_comments(
             "author_avatar": (author.avatar_url or "") if author else "",
             "content": c.content,
             "created_at": c.created_at.strftime("%Y.%m.%d %H:%M") if c.created_at else "",
+            "like_count": like_counts.get(c.id, 0),
+            "is_liked_by_me": c.id in my_likes,
+            "is_best": c.id == best_comment_id and max_likes > 0,
         })
     return result
 
