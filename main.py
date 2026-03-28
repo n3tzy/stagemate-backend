@@ -10,6 +10,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from database import engine, get_db
 import db_models
 from config import settings
@@ -95,7 +96,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
     )
 
 
-# ── DB 마이그레이션 (kakao_id 컬럼 자동 추가) ────────
+# ── DB 마이그레이션 (startup 시 누락 컬럼 자동 추가) ─────
 @app.on_event("startup")
 async def run_migrations():
     from sqlalchemy import text
@@ -133,6 +134,37 @@ async def run_migrations():
             is_read BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT NOW()
         )""",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS logo_url VARCHAR",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS banner_url VARCHAR",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS theme_color VARCHAR(7)",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'free' NOT NULL",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMP",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS storage_used_mb BIGINT DEFAULT 0",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS storage_quota_extra_mb BIGINT DEFAULT 0",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS boost_credits INTEGER DEFAULT 0",
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS is_boosted BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS boost_expires_at TIMESTAMP",
+        """CREATE TABLE IF NOT EXISTS subscription_transactions (
+            id SERIAL PRIMARY KEY,
+            club_id INTEGER REFERENCES clubs(id),
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            product_id VARCHAR NOT NULL,
+            transaction_id VARCHAR UNIQUE NOT NULL,
+            platform VARCHAR(20) NOT NULL,
+            purchased_at TIMESTAMP NOT NULL,
+            expires_at TIMESTAMP,
+            status VARCHAR(20) DEFAULT 'active' NOT NULL,
+            raw_payload TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS presign_requests (
+            key VARCHAR PRIMARY KEY,
+            club_id INTEGER REFERENCES clubs(id),
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            file_size_mb INTEGER NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""",
     ]:
         try:
             with engine.connect() as conn:
@@ -159,6 +191,14 @@ def check_username(request: Request, username: str, db: Session = Depends(get_db
 def check_displayname(request: Request, display_name: str, db: Session = Depends(get_db)):
     """닉네임 중복 확인"""
     exists = db.query(db_models.User).filter(db_models.User.display_name == display_name).first()
+    return {"available": exists is None}
+
+
+@app.get("/auth/check-nickname")
+@limiter.limit("20/minute")
+def check_nickname(request: Request, nickname: str, db: Session = Depends(get_db)):
+    """커뮤니티 닉네임 중복 확인"""
+    exists = db.query(db_models.User).filter(db_models.User.nickname == nickname).first()
     return {"available": exists is None}
 
 
@@ -210,14 +250,24 @@ def register(request: Request, req: RegisterRequest, db: Session = Depends(get_d
     if db.query(db_models.User).filter(db_models.User.display_name == req.display_name).first():
         raise HTTPException(status_code=400, detail="이미 사용 중인 닉네임입니다.")
 
+    if db.query(db_models.User).filter(
+        db_models.User.nickname == req.nickname
+    ).first():
+        raise HTTPException(status_code=400, detail="이미 사용 중인 닉네임입니다.")
+
     user = db_models.User(
         username=req.username,
         display_name=req.display_name,
+        nickname=req.nickname,
         email=req.email,
         hashed_password=hash_password(req.password),
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="이미 사용 중인 아이디, 닉네임 또는 이메일입니다.")
     db.refresh(user)
     logger.info(f"New user registered: {user.username}")
     return {
@@ -583,7 +633,9 @@ def create_club(
 
 
 @app.post("/clubs/join")
+@limiter.limit("10/minute")  # 초대코드 브루트포스 방어
 def join_club(
+    request: Request,
     req: ClubJoinRequest,
     db: Session = Depends(get_db),
     current_user: db_models.User = Depends(get_current_user)
@@ -981,6 +1033,14 @@ def delete_comment(
     db: Session = Depends(get_db),
     member: db_models.ClubMember = Depends(require_any_member)
 ):
+    # 공지가 같은 클럽 소속인지 먼저 확인 (H-1: IDOR 방어)
+    notice = db.query(db_models.Notice).filter(
+        db_models.Notice.id == notice_id,
+        db_models.Notice.club_id == member.club_id,
+    ).first()
+    if not notice:
+        raise HTTPException(status_code=404, detail="공지사항을 찾을 수 없습니다.")
+
     comment = db.query(db_models.NoticeComment).filter(
         db_models.NoticeComment.id == comment_id,
         db_models.NoticeComment.notice_id == notice_id,
@@ -1154,7 +1214,9 @@ def create_post(
 
 
 @app.get("/posts")
+@limiter.limit("60/minute")
 def get_posts(
+    request: Request,
     is_global: bool = False,
     offset: int = 0,
     limit: int = 20,
@@ -1162,6 +1224,7 @@ def get_posts(
     member: db_models.ClubMember = Depends(require_any_member),
 ):
     """게시글 목록 조회 (동아리 피드 or 전체 채널, 최신순)"""
+    limit = min(limit, 50)  # L-1: 최대 50개 제한 (DoS 방어)
     query = db.query(db_models.Post)
     if is_global:
         query = query.filter(db_models.Post.is_global == True)
@@ -1181,8 +1244,13 @@ def get_posts(
             db_models.PostLike.post_id == p.id,
             db_models.PostLike.user_id == member.user_id,
         ).first() is not None
-        # 표시 이름: post_author_name 우선, 없으면 실명
-        display_author = p.post_author_name or (author.display_name if author else "탈퇴한 사용자")
+        # 표시 이름: 전체 채널은 닉네임/익명만 사용, 동아리 내부는 실명 사용
+        if p.is_global:
+            # 전체 채널: post_author_name(닉네임 or "익명")만 사용, display_name 폴백 금지
+            display_author = p.post_author_name or "알 수 없음"
+        else:
+            # 동아리 내부: 실명 사용
+            display_author = p.post_author_name or (author.display_name if author else "탈퇴한 사용자")
         # 익명 글이면 아바타 노출 안 함
         author_avatar = (
             None if (p.is_anonymous)
@@ -1236,6 +1304,9 @@ def toggle_like(
     post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="게시글을 찾을 수 없습니다.")
+    # 비공개 클럽 게시글은 같은 클럽 멤버만 좋아요 가능 (M-2: 클럽 경계)
+    if not post.is_global and post.club_id != member.club_id:
+        raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
     existing = db.query(db_models.PostLike).filter(
         db_models.PostLike.post_id == post_id,
         db_models.PostLike.user_id == member.user_id,
@@ -1260,18 +1331,26 @@ def get_post_comments(
 ):
     """게시글 댓글 목록 (조회 시 view_count +1)"""
     post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
-    if post:
-        post.view_count = (post.view_count or 0) + 1
-        db.commit()
+    if not post:
+        raise HTTPException(status_code=404, detail="게시글을 찾을 수 없습니다.")
+    # 비공개 클럽 게시글은 같은 클럽 멤버만 조회 가능 (M-1: 클럽 경계)
+    if not post.is_global and post.club_id != member.club_id:
+        raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
+    post.view_count = (post.view_count or 0) + 1
+    db.commit()
     comments = db.query(db_models.PostComment).filter(
         db_models.PostComment.post_id == post_id
     ).order_by(db_models.PostComment.created_at.asc()).all()
     result = []
     for c in comments:
         author = db.query(db_models.User).filter(db_models.User.id == c.author_id).first()
+        if post and post.is_global:
+            author_name = (author.nickname if author and author.nickname else "알 수 없음")
+        else:
+            author_name = (author.display_name if author else "탈퇴한 사용자")
         result.append({
             "id": c.id,
-            "author": author.display_name if author else "탈퇴한 사용자",
+            "author": author_name,
             "author_id": c.author_id,
             "author_avatar": (author.avatar_url or "") if author else "",
             "content": c.content,
@@ -1305,7 +1384,7 @@ def create_post_comment(
 
     # ── 게시글 작성자에게 알림 생성 (본인 댓글 제외) ──────
     if post.author_id != member.user_id:
-        actor_name = author.display_name if author else "누군가"
+        actor_name = (author.nickname if author and author.nickname else "알 수 없음") if post and post.is_global else (author.display_name if author else "알 수 없음")
         preview = req.content[:30] + ("..." if len(req.content) > 30 else "")
         notif = db_models.Notification(
             user_id=post.author_id,
@@ -1318,7 +1397,7 @@ def create_post_comment(
 
     return {
         "id": comment.id,
-        "author": author.display_name if author else "",
+        "author": (author.nickname if author and author.nickname else "알 수 없음") if post and post.is_global else (author.display_name if author else "탈퇴한 사용자"),
         "content": comment.content,
         "created_at": comment.created_at.strftime("%Y.%m.%d %H:%M") if comment.created_at else "",
     }
@@ -1616,6 +1695,34 @@ def get_presigned_url(
     member: db_models.ClubMember = Depends(require_any_member),
 ):
     """R2 presigned upload URL 발급 (R2 설정이 없으면 503 반환)"""
+    import re as _re
+    import uuid
+
+    # ── MIME 타입 화이트리스트 (CDN XSS 방어) ────────────
+    ALLOWED_CONTENT_TYPES = {
+        "image/jpeg", "image/png", "image/gif", "image/webp",
+        "video/mp4", "video/quicktime", "video/webm",
+    }
+    if content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail="허용되지 않는 파일 형식입니다.")
+
+    # ── 확장자 화이트리스트 ───────────────────────────────
+    ALLOWED_EXTENSIONS = {
+        ".jpg", ".jpeg", ".png", ".gif", ".webp",
+        ".mp4", ".mov", ".webm",
+    }
+    dot_pos = filename.rfind(".")
+    ext = filename[dot_pos:].lower() if dot_pos != -1 else ""
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="허용되지 않는 파일 확장자입니다.")
+
+    # ── filename 경로 인젝션 / 위험 문자 제거 ────────────
+    # 경로 구분자, null byte, 공백 등 제거 후 UUID 기반 키 생성
+    safe_name = _re.sub(r'[^\w.\-]', '_', filename)  # 영문/숫자/_.-, 나머지는 _로
+    safe_name = safe_name.lstrip('.')                 # 숨김파일 방지
+    if not safe_name:
+        safe_name = "file"
+
     if not settings.R2_ACCESS_KEY_ID or not settings.R2_BUCKET_NAME:
         raise HTTPException(
             status_code=503,
@@ -1623,9 +1730,8 @@ def get_presigned_url(
         )
     import boto3
     from botocore.config import Config
-    import uuid
 
-    key = f"posts/{uuid.uuid4()}/{filename}"
+    key = f"posts/{uuid.uuid4()}/{safe_name}"
     s3 = boto3.client(
         "s3",
         endpoint_url=f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
@@ -1634,10 +1740,19 @@ def get_presigned_url(
         config=Config(signature_version="s3v4"),
         region_name="auto",
     )
+    # 파일 크기 제한: 이미지 30MB / 영상 1.5GB
+    # (ContentLength는 presigned PUT에서 exact-match라 Params에 넣으면 안 됨 — Flutter에서 사전 체크)
+    is_video = content_type.startswith("video/")
+    max_bytes = 1536 * 1024 * 1024 if is_video else 30 * 1024 * 1024  # 1.5GB / 30MB
+
     presigned = s3.generate_presigned_url(
         "put_object",
-        Params={"Bucket": settings.R2_BUCKET_NAME, "Key": key, "ContentType": content_type},
+        Params={
+            "Bucket": settings.R2_BUCKET_NAME,
+            "Key": key,
+            "ContentType": content_type,
+        },
         ExpiresIn=300,  # 5분
     )
     public_url = f"{settings.R2_PUBLIC_URL}/{key}" if settings.R2_PUBLIC_URL else ""
-    return {"upload_url": presigned, "public_url": public_url, "key": key}
+    return {"upload_url": presigned, "public_url": public_url, "key": key, "max_bytes": max_bytes}
