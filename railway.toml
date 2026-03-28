@@ -1,0 +1,15 @@
+# railway.toml — StageMate 백엔드 배포 설정
+#
+# Railway 대시보드에서 두 개의 서비스를 생성하세요:
+#   1. api    — FastAPI 앱 (startCommand = uvicorn main:app ...)
+#   2. cron   — 정기 작업 (startCommand = python cron.py, cronSchedule 적용)
+#
+# 이 파일은 cron 서비스에 연결된 Railway 서비스 설정입니다.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python cron.py"
+cronSchedule = "0 * * * *"   # 매시 정각 실행
+restartPolicyType = "NEVER"  # cron은 실행 후 종료, 재시작 불필요
