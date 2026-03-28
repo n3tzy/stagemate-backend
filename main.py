@@ -3,7 +3,7 @@ import os
 import secrets
 import string
 import httpx
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
@@ -37,6 +37,7 @@ from models import (
     SubscriptionVerifyRequest,
     BoostRequest,
     PerformanceCreateRequest, AudioSubmissionRequest,
+    FcmTokenRequest,
 )
 from scheduler import calculate_schedule
 from group_schedule import find_common_slots_from_db
@@ -111,6 +112,39 @@ _run_migrations()
 
 # ── Rate Limiter 설정 ──────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
+
+# ── Firebase Admin SDK 초기화 ──────────────────────────
+import firebase_admin
+from firebase_admin import credentials as fb_credentials, messaging as fb_messaging
+import json
+
+_firebase_app = None
+_firebase_creds_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+if _firebase_creds_json:
+    try:
+        _cred = fb_credentials.Certificate(json.loads(_firebase_creds_json))
+        _firebase_app = firebase_admin.initialize_app(_cred)
+        logging.info("Firebase Admin SDK initialized.")
+    except Exception as _fb_err:
+        logging.warning("Firebase init failed: %s", _fb_err)
+else:
+    logging.info("FIREBASE_CREDENTIALS_JSON not set — push notifications disabled.")
+
+
+def _send_push(token: str, title: str, body: str, post_id: int) -> None:
+    """Fire-and-forget FCM push. Errors are logged, never raised."""
+    if not _firebase_app or not token:
+        return
+    try:
+        fb_messaging.send(fb_messaging.Message(
+            notification=fb_messaging.Notification(title=title, body=body),
+            data={"post_id": str(post_id)},
+            token=token,
+        ))
+        logging.info("FCM push sent to token %s...", token[:10])
+    except Exception as e:
+        logging.warning("FCM send failed (token=%s...): %s", token[:10], e)
+
 
 app = FastAPI(
     title="StageMate API 🎭",

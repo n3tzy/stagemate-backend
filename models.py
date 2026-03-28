@@ -382,3 +382,7 @@ class AudioSubmissionRequest(BaseModel):
         if not v.lower().endswith('.mp3'):
             raise ValueError('MP3 파일만 허용됩니다.')
         return v
+
+
+class FcmTokenRequest(BaseModel):
+    token: str = Field(..., min_length=1, max_length=512)

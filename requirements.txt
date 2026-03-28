@@ -13,3 +13,4 @@ psycopg2-binary
 fastapi-mail
 httpx
 boto3>=1.34.0
+firebase-admin
