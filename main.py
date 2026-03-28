@@ -1251,7 +1251,12 @@ def get_posts(
             db_models.Post.club_id == member.club_id,
             db_models.Post.is_global == False,
         )
-    posts = query.order_by(db_models.Post.created_at.desc()).offset(offset).limit(limit).all()
+    from sqlalchemy import desc, nulls_last
+    posts = query.order_by(
+        desc(db_models.Post.is_boosted),
+        nulls_last(desc(db_models.Post.boost_expires_at)),
+        desc(db_models.Post.created_at),
+    ).offset(offset).limit(limit).all()
 
     result = []
     for p in posts:
@@ -1287,6 +1292,7 @@ def get_posts(
             "view_count": p.view_count or 0,
             "my_liked": my_liked,
             "is_global": p.is_global,
+            "is_boosted": p.is_boosted or False,
             "created_at": p.created_at.strftime("%Y.%m.%d %H:%M") if p.created_at else "",
         })
     return result
@@ -1310,6 +1316,45 @@ def delete_post(
     db.delete(post)
     db.commit()
     return {"message": "삭제됐습니다."}
+
+
+@app.post("/posts/{post_id}/boost")
+@limiter.limit("10/minute")
+def boost_post(
+    request: Request,
+    post_id: int,
+    db:      Session = Depends(get_db),
+    member:  db_models.ClubMember = Depends(require_any_member),
+):
+    """게시글 홍보 부스트 — 크레딧 차감, 24시간 상단 고정 (super_admin만)"""
+    if member.role != "super_admin":
+        raise HTTPException(status_code=403, detail="동아리장만 홍보 부스트를 사용할 수 있습니다.")
+
+    post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="게시글을 찾을 수 없습니다.")
+    if post.club_id != member.club_id:
+        raise HTTPException(status_code=403, detail="해당 동아리의 게시글이 아닙니다.")
+    if not post.is_global:
+        raise HTTPException(status_code=400, detail="전체 채널 게시글만 홍보 부스트할 수 있습니다.")
+    if post.is_boosted:
+        raise HTTPException(status_code=409, detail="이미 부스트 중인 게시글입니다.")
+
+    # with_for_update: 동시 부스트 레이스 컨디션 방어
+    club = db.query(db_models.Club).filter(
+        db_models.Club.id == member.club_id
+    ).with_for_update().first()
+    if not club or (club.boost_credits or 0) <= 0:
+        raise HTTPException(status_code=402, detail="홍보 부스트 크레딧이 없습니다. STANDARD 이상 구독이 필요합니다.")
+
+    post.is_boosted = True
+    post.boost_expires_at = datetime.utcnow() + timedelta(hours=24)
+    club.boost_credits -= 1
+    db.commit()
+    return {
+        "message": "홍보 부스트가 적용됐습니다. 24시간 동안 상단에 노출됩니다.",
+        "credits_remaining": club.boost_credits,
+    }
 
 
 @app.post("/posts/{post_id}/likes")
