@@ -124,12 +124,12 @@ def generate_invite_code() -> tuple[str, datetime]:
 
 # ── 동아리 멤버십 의존성 (X-Club-Id 헤더 기반) ──────
 def get_club_member(
-    club_id: int = Header(..., alias="X-Club-Id"),
+    x_club_id: int = Header(..., alias="X-Club-Id"),
     current_user: db_models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> db_models.ClubMember:
     member = db.query(db_models.ClubMember).filter(
-        db_models.ClubMember.club_id == club_id,
+        db_models.ClubMember.club_id == x_club_id,
         db_models.ClubMember.user_id == current_user.id
     ).first()
     if not member:
