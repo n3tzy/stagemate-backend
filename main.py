@@ -1,4 +1,5 @@
 import logging
+import os
 import secrets
 import string
 import httpx
@@ -9,6 +10,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy import desc, nulls_last
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from database import engine, get_db
@@ -32,6 +34,8 @@ from models import (
     DeleteAccountRequest, PostRequest, PostCommentRequest, NicknameRequest,
     PostEditRequest, ReportRequest,
     ClubProfileUpdate,
+    SubscriptionVerifyRequest,
+    BoostRequest,
 )
 from scheduler import calculate_schedule
 from group_schedule import find_common_slots_from_db
@@ -44,6 +48,20 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("performance-manager")
+
+# ── 구독 플랜 매핑 ────────────────────────────────────
+PLAN_MAP = {
+    "stagemate_standard_monthly": "standard",
+    "stagemate_standard_early":   "standard",
+    "stagemate_pro_monthly":      "pro",
+    "stagemate_pro_early":        "pro",
+    "stagemate_personal_monthly": "personal",  # Phase 2에서 사용
+}
+BOOST_CREDITS_MAP = {"standard": 1, "pro": 3, "free": 0}
+
+# 웹훅 서명 검증 플래그 (Railway 환경변수로 설정)
+# ⚠️ 서명 검증 구현 전까지 "false"로 유지
+WEBHOOK_VERIFICATION_ENABLED = os.getenv("WEBHOOK_VERIFICATION_ENABLED", "false") == "true"
 
 # DB 테이블 자동 생성
 db_models.Base.metadata.create_all(bind=engine)
@@ -1234,7 +1252,11 @@ def get_posts(
             db_models.Post.club_id == member.club_id,
             db_models.Post.is_global == False,
         )
-    posts = query.order_by(db_models.Post.created_at.desc()).offset(offset).limit(limit).all()
+    posts = query.order_by(
+        desc(db_models.Post.is_boosted),
+        nulls_last(desc(db_models.Post.boost_expires_at)),
+        desc(db_models.Post.created_at),
+    ).offset(offset).limit(limit).all()
 
     result = []
     for p in posts:
@@ -1270,6 +1292,7 @@ def get_posts(
             "view_count": p.view_count or 0,
             "my_liked": my_liked,
             "is_global": p.is_global,
+            "is_boosted": p.is_boosted or False,
             "created_at": p.created_at.strftime("%Y.%m.%d %H:%M") if p.created_at else "",
         })
     return result
@@ -1293,6 +1316,45 @@ def delete_post(
     db.delete(post)
     db.commit()
     return {"message": "삭제됐습니다."}
+
+
+@app.post("/posts/{post_id}/boost")
+@limiter.limit("10/minute")
+def boost_post(
+    request: Request,
+    post_id: int,
+    db:      Session = Depends(get_db),
+    member:  db_models.ClubMember = Depends(require_any_member),
+):
+    """게시글 홍보 부스트 — 크레딧 차감, 24시간 상단 고정 (super_admin만)"""
+    if member.role != "super_admin":
+        raise HTTPException(status_code=403, detail="동아리장만 홍보 부스트를 사용할 수 있습니다.")
+
+    post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="게시글을 찾을 수 없습니다.")
+    if post.club_id != member.club_id:
+        raise HTTPException(status_code=403, detail="해당 동아리의 게시글이 아닙니다.")
+    if not post.is_global:
+        raise HTTPException(status_code=400, detail="전체 채널 게시글만 홍보 부스트할 수 있습니다.")
+    if post.is_boosted:
+        raise HTTPException(status_code=409, detail="이미 부스트 중인 게시글입니다.")
+
+    # with_for_update: 동시 부스트 레이스 컨디션 방어
+    club = db.query(db_models.Club).filter(
+        db_models.Club.id == member.club_id
+    ).with_for_update().first()
+    if not club or (club.boost_credits or 0) <= 0:
+        raise HTTPException(status_code=402, detail="홍보 부스트 크레딧이 없습니다. STANDARD 이상 구독이 필요합니다.")
+
+    post.is_boosted = True
+    post.boost_expires_at = datetime.utcnow() + timedelta(hours=24)
+    club.boost_credits -= 1
+    db.commit()
+    return {
+        "message": "홍보 부스트가 적용됐습니다. 24시간 동안 상단에 노출됩니다.",
+        "credits_remaining": club.boost_credits,
+    }
 
 
 @app.post("/posts/{post_id}/likes")
@@ -1609,6 +1671,100 @@ def update_club_profile(
 
 
 # ════════════════════════════════════════════════
+#  동아리 구독
+# ════════════════════════════════════════════════
+
+@app.post("/clubs/{club_id}/subscription/verify")
+@limiter.limit("5/minute")
+def verify_club_subscription(
+    request:      Request,
+    club_id:      int,
+    req:          SubscriptionVerifyRequest,
+    db:           Session = Depends(get_db),
+    current_user: db_models.User = Depends(get_current_user),
+):
+    """동아리 인앱결제 영수증 검증 후 플랜 업데이트 (super_admin만)"""
+    me = db.query(db_models.ClubMember).filter(
+        db_models.ClubMember.club_id == club_id,
+        db_models.ClubMember.user_id == current_user.id,
+    ).first()
+    if not me or me.role != "super_admin":
+        raise HTTPException(status_code=403, detail="회장만 구독을 변경할 수 있습니다.")
+
+    # 중복 transaction_id 방지
+    dup = db.query(db_models.SubscriptionTransaction).filter(
+        db_models.SubscriptionTransaction.transaction_id == req.transaction_id
+    ).first()
+    if dup:
+        raise HTTPException(status_code=409, detail="이미 처리된 영수증입니다.")
+
+    plan = PLAN_MAP.get(req.product_id)
+    if not plan or plan == "personal":
+        raise HTTPException(status_code=400, detail="올바르지 않은 동아리 구독 상품입니다.")
+
+    # ⚠️ 영수증 형식 확인만 (개발/테스트용) — 프로덕션 전 실제 Apple/Google 검증 필수
+    if not req.receipt_data:
+        raise HTTPException(status_code=400, detail="영수증 데이터가 없습니다.")
+
+    purchased_at = datetime.utcnow()
+    expires_at = purchased_at + timedelta(days=31)
+
+    club = db.query(db_models.Club).filter(db_models.Club.id == club_id).first()
+    if not club:
+        raise HTTPException(status_code=404, detail="동아리를 찾을 수 없습니다.")
+    club.plan = plan
+    club.plan_expires_at = expires_at
+    club.boost_credits = BOOST_CREDITS_MAP.get(plan, 0)
+
+    txn = db_models.SubscriptionTransaction(
+        club_id=club_id,
+        user_id=current_user.id,
+        product_id=req.product_id,
+        transaction_id=req.transaction_id,
+        platform=req.platform,
+        purchased_at=purchased_at,
+        expires_at=expires_at,
+        status="active",
+        raw_payload=req.receipt_data[:500],
+    )
+    db.add(txn)
+    db.commit()
+    return {
+        "message": f"'{plan}' 플랜이 활성화됐습니다.",
+        "plan": plan,
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+@app.get("/clubs/{club_id}/subscription")
+def get_club_subscription(
+    club_id:      int,
+    db:           Session = Depends(get_db),
+    current_user: db_models.User = Depends(get_current_user),
+):
+    """구독 상태 조회 (super_admin만)"""
+    me = db.query(db_models.ClubMember).filter(
+        db_models.ClubMember.club_id == club_id,
+        db_models.ClubMember.user_id == current_user.id,
+    ).first()
+    if not me or me.role != "super_admin":
+        raise HTTPException(status_code=403, detail="회장만 조회할 수 있습니다.")
+
+    club = db.query(db_models.Club).filter(db_models.Club.id == club_id).first()
+    if not club:
+        raise HTTPException(status_code=404, detail="동아리를 찾을 수 없습니다.")
+    quota_mb = {"free": 10240, "standard": 30720, "pro": 102400}.get(club.plan or "free", 10240)
+    quota_mb += (club.storage_quota_extra_mb or 0)
+    return {
+        "plan":            club.plan or "free",
+        "plan_expires_at": club.plan_expires_at.isoformat() if club.plan_expires_at else None,
+        "storage_used_mb": club.storage_used_mb or 0,
+        "storage_quota_mb": quota_mb,
+        "boost_credits":   club.boost_credits or 0,
+    }
+
+
+# ════════════════════════════════════════════════
 #  핫 동아리 순위
 # ════════════════════════════════════════════════
 
@@ -1897,3 +2053,86 @@ def report_storage(
     db.expire_all()
     club = db.query(db_models.Club).filter(db_models.Club.id == club_id).first()
     return {"message": "사용량이 업데이트됐습니다.", "storage_used_mb": club.storage_used_mb if club else 0}
+
+
+# ════════════════════════════════════════════════
+#  인앱결제 웹훅 (Apple / Google)
+# ════════════════════════════════════════════════
+
+def _extend_subscription(txn: db_models.SubscriptionTransaction, db: Session):
+    """구독 갱신 — plan_expires_at +31일"""
+    if txn.club_id:
+        club = db.query(db_models.Club).filter(db_models.Club.id == txn.club_id).first()
+        if club:
+            club.plan_expires_at = (club.plan_expires_at or datetime.utcnow()) + timedelta(days=31)
+            db.commit()
+
+
+def _cancel_subscription(txn: db_models.SubscriptionTransaction, db: Session):
+    """구독 취소/만료 — free 플랜으로 강등"""
+    if txn.club_id:
+        club = db.query(db_models.Club).filter(db_models.Club.id == txn.club_id).first()
+        if club:
+            club.plan = "free"
+            club.plan_expires_at = None
+            club.boost_credits = 0
+    txn.status = "cancelled"
+    db.commit()
+
+
+@app.post("/webhooks/apple")
+async def apple_webhook(request: Request, db: Session = Depends(get_db)):
+    """Apple App Store Server Notifications V2"""
+    if not WEBHOOK_VERIFICATION_ENABLED:
+        logger.warning("Apple webhook received but WEBHOOK_VERIFICATION_ENABLED=false, skipping.")
+        return {"status": "ok"}
+    body = await request.body()
+    # TODO: Apple JWS 서명 검증 (python-jose + Apple 루트 인증서)
+    try:
+        import json, base64
+        payload = json.loads(body)
+        signed_payload = payload.get("signedPayload", "")
+        parts = signed_payload.split(".")
+        if len(parts) >= 2:
+            padded = parts[1] + "=" * (-len(parts[1]) % 4)
+            data = json.loads(base64.urlsafe_b64decode(padded))
+            notification_type = data.get("notificationType", "")
+            transaction_id = data.get("data", {}).get("signedTransactionInfo", "")[:50]
+            txn = db.query(db_models.SubscriptionTransaction).filter(
+                db_models.SubscriptionTransaction.transaction_id == transaction_id
+            ).first()
+            if txn and notification_type in ("DID_RENEW", "SUBSCRIBED"):
+                _extend_subscription(txn, db)
+            elif txn and notification_type in ("DID_FAIL_TO_RENEW", "EXPIRED", "REFUND"):
+                _cancel_subscription(txn, db)
+    except Exception as e:
+        logger.error(f"Apple webhook error: {e}")
+    return {"status": "ok"}
+
+
+@app.post("/webhooks/google")
+async def google_webhook(request: Request, db: Session = Depends(get_db)):
+    """Google Play Real-time Developer Notifications"""
+    if not WEBHOOK_VERIFICATION_ENABLED:
+        logger.warning("Google webhook received but WEBHOOK_VERIFICATION_ENABLED=false, skipping.")
+        return {"status": "ok"}
+    body = await request.body()
+    # TODO: Google Pub/Sub 서명 검증
+    try:
+        import json, base64
+        payload = json.loads(body)
+        msg_data = base64.b64decode(payload.get("message", {}).get("data", "")).decode()
+        data = json.loads(msg_data)
+        notification_type = data.get("subscriptionNotification", {}).get("notificationType", 0)
+        purchase_token    = data.get("subscriptionNotification", {}).get("purchaseToken", "")
+        txn = db.query(db_models.SubscriptionTransaction).filter(
+            db_models.SubscriptionTransaction.transaction_id == purchase_token[:50]
+        ).first()
+        if txn:
+            if notification_type in (4, 2):   # PURCHASED, RENEWED
+                _extend_subscription(txn, db)
+            elif notification_type in (3, 13): # CANCELED, EXPIRED
+                _cancel_subscription(txn, db)
+    except Exception as e:
+        logger.error(f"Google webhook error: {e}")
+    return {"status": "ok"}
