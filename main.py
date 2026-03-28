@@ -31,6 +31,7 @@ from models import (
     KakaoLoginRequest, CommentRequest,
     DeleteAccountRequest, PostRequest, PostCommentRequest, NicknameRequest,
     PostEditRequest, ReportRequest,
+    ClubProfileUpdate,
 )
 from scheduler import calculate_schedule
 from group_schedule import find_common_slots_from_db
@@ -1536,6 +1537,78 @@ def report_post_comment(
 
 
 # ════════════════════════════════════════════════
+#  동아리 프로필
+# ════════════════════════════════════════════════
+
+@app.get("/clubs/{club_id}/profile")
+def get_club_profile(
+    club_id: int,
+    db: Session = Depends(get_db),
+    current_user: db_models.User = Depends(get_current_user),
+):
+    """동아리 프로필 조회 (로그인한 사용자 누구나)"""
+    club = db.query(db_models.Club).filter(db_models.Club.id == club_id).first()
+    if not club:
+        raise HTTPException(status_code=404, detail="동아리를 찾을 수 없습니다.")
+    member_count = db.query(db_models.ClubMember).filter(
+        db_models.ClubMember.club_id == club_id
+    ).count()
+    return {
+        "club_id": club.id,
+        "name": club.name,
+        "logo_url": club.logo_url,
+        "banner_url": club.banner_url,
+        "theme_color": club.theme_color,
+        "member_count": member_count,
+    }
+
+
+@app.patch("/clubs/{club_id}/profile")
+@limiter.limit("10/minute")
+def update_club_profile(
+    request: Request,
+    club_id: int,
+    req: ClubProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user: db_models.User = Depends(get_current_user),
+):
+    """동아리 프로필 수정 (해당 동아리 super_admin만)"""
+    # 1) 동아리 존재 확인 (먼저 404, 그 다음 403)
+    club = db.query(db_models.Club).filter(db_models.Club.id == club_id).first()
+    if not club:
+        raise HTTPException(status_code=404, detail="동아리를 찾을 수 없습니다.")
+
+    # 2) 권한 확인: path param club_id 기준으로 super_admin 체크
+    # NOTE: 헤더 기반 require_super_admin 의존성 사용 금지 — path param 기준으로 직접 체크
+    membership = db.query(db_models.ClubMember).filter(
+        db_models.ClubMember.club_id == club_id,
+        db_models.ClubMember.user_id == current_user.id,
+        db_models.ClubMember.role == "super_admin",
+    ).first()
+    if not membership:
+        raise HTTPException(status_code=403, detail="동아리 프로필 수정 권한이 없습니다.")
+
+    # 3) model_fields_set으로 명시적으로 전달된 필드만 업데이트
+    for field in req.model_fields_set:
+        setattr(club, field, getattr(req, field))
+
+    db.commit()
+    db.refresh(club)
+
+    member_count = db.query(db_models.ClubMember).filter(
+        db_models.ClubMember.club_id == club_id
+    ).count()
+    return {
+        "club_id": club.id,
+        "name": club.name,
+        "logo_url": club.logo_url,
+        "banner_url": club.banner_url,
+        "theme_color": club.theme_color,
+        "member_count": member_count,
+    }
+
+
+# ════════════════════════════════════════════════
 #  핫 동아리 순위
 # ════════════════════════════════════════════════
 
@@ -1579,7 +1652,7 @@ def get_hot_clubs(
     for rank, (club_id, score) in enumerate(ranked, 1):
         club = db.query(db_models.Club).filter(db_models.Club.id == club_id).first()
         if club:
-            result.append({"rank": rank, "club_name": club.name, "score": score})
+            result.append({"rank": rank, "club_id": club.id, "club_name": club.name, "score": score})
     return result
 
 
