@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy import desc, nulls_last
+from sqlalchemy import desc, nulls_last, text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from database import engine, get_db
@@ -66,6 +66,46 @@ WEBHOOK_VERIFICATION_ENABLED = os.getenv("WEBHOOK_VERIFICATION_ENABLED", "false"
 
 # DB 테이블 자동 생성
 db_models.Base.metadata.create_all(bind=engine)
+
+
+def _run_migrations() -> None:
+    """기존 테이블에 새 컬럼을 안전하게 추가 (ADD COLUMN IF NOT EXISTS).
+    Alembic 없이 Railway 재배포 시 스키마 변경을 자동 적용한다."""
+    migrations = [
+        # posts 테이블 — boost 기능 (Tasks 12-13)
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS is_boosted BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS boost_expires_at TIMESTAMP",
+        # users 테이블 — 로그인 잠금 (보안 강화)
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP",
+        # users 테이블 — 닉네임, 아바타, 소프트삭제
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname VARCHAR UNIQUE",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS reregister_allowed_at TIMESTAMP",
+        # users 테이블 — 카카오 소셜 로그인
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS kakao_id VARCHAR UNIQUE",
+        # clubs 테이블 — 구독/플랜 (Tasks 9-11)
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS logo_url VARCHAR",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS banner_url VARCHAR",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS theme_color VARCHAR(7)",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS plan VARCHAR(20) NOT NULL DEFAULT 'free'",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMP",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS storage_used_mb BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS storage_quota_extra_mb BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS boost_credits INTEGER NOT NULL DEFAULT 0",
+    ]
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(text(sql))
+            except Exception as exc:
+                logging.warning("Migration skipped (%s): %s", sql[:60], exc)
+        conn.commit()
+    logging.info("DB migrations applied.")
+
+
+_run_migrations()
 
 # ── Rate Limiter 설정 ──────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
