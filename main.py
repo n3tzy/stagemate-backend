@@ -181,6 +181,22 @@ def _send_announcement_push(tokens: list, club_name: str, notice_title: str, not
             logging.warning("Announcement FCM send failed (token=%s...): %s", token[:10], e)
 
 
+def _send_audio_submitted_push(tokens: list, club_name: str, team_name: str, song_title: str) -> None:
+    """새 음원 제출 시 해당 동아리 admin/super_admin에게 FCM 푸시 발송."""
+    for token in tokens:
+        try:
+            fb_messaging.send(fb_messaging.Message(
+                notification=fb_messaging.Notification(
+                    title=f"[{club_name}] 새 음원 제출",
+                    body=f"{team_name}팀이 '{song_title}' 음원을 제출했습니다.",
+                ),
+                data={"type": "audio_submitted"},
+                token=token,
+            ))
+        except Exception as e:
+            logger.error(f"Audio submitted push failed: {e}")
+
+
 app = FastAPI(
     title="StageMate API 🎭",
     # 프로덕션에서 자동 문서 노출 제한
@@ -2098,6 +2114,7 @@ def upsert_submission(
     club_id: int,
     perf_id: int,
     req: AudioSubmissionRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     member: db_models.ClubMember = Depends(require_team_leader),
 ):
@@ -2139,6 +2156,24 @@ def upsert_submission(
         db.add(sub)
         db.commit()
         db.refresh(sub)
+
+        # admin/super_admin에게 새 음원 제출 푸시 알림 발송
+        club = db.query(db_models.Club).filter(db_models.Club.id == club_id).first()
+        club_name = club.name if club else "동아리"
+        admins = db.query(db_models.ClubMember).filter(
+            db_models.ClubMember.club_id == club_id,
+            db_models.ClubMember.role.in_(["admin", "super_admin"])
+        ).all()
+        admin_tokens = [m.user.fcm_token for m in admins if m.user and m.user.fcm_token]
+        if admin_tokens:
+            background_tasks.add_task(
+                _send_audio_submitted_push,
+                admin_tokens,
+                club_name,
+                req.team_name,
+                req.song_title,
+            )
+
         return {"id": sub.id, "message": "음원이 제출됐습니다."}
 
 
