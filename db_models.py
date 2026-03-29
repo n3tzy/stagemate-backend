@@ -181,6 +181,7 @@ class PostComment(Base):
     post_id = Column(Integer, ForeignKey("posts.id"), nullable=False)
     author_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     content = Column(String, nullable=False)
+    parent_id = Column(Integer, ForeignKey('post_comments.id'), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     post = relationship("Post", back_populates="comments")
     author = relationship("User")

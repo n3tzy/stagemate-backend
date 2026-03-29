@@ -240,6 +240,7 @@ async def run_migrations():
         "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS boost_credits INTEGER DEFAULT 0",
         "ALTER TABLE posts ADD COLUMN IF NOT EXISTS is_boosted BOOLEAN DEFAULT FALSE",
         "ALTER TABLE posts ADD COLUMN IF NOT EXISTS boost_expires_at TIMESTAMP",
+        "ALTER TABLE post_comments ADD COLUMN IF NOT EXISTS parent_id INTEGER REFERENCES post_comments(id)",
         """CREATE TABLE IF NOT EXISTS subscription_transactions (
             id SERIAL PRIMARY KEY,
             club_id INTEGER REFERENCES clubs(id),
@@ -1525,6 +1526,7 @@ def get_post_comments(
             "author_id": c.author_id,
             "author_avatar": (author.avatar_url or "") if author else "",
             "content": c.content,
+            "parent_id": c.parent_id,
             "created_at": c.created_at.strftime("%Y.%m.%d %H:%M") if c.created_at else "",
             "like_count": like_counts.get(c.id, 0),
             "is_liked_by_me": c.id in my_likes,
@@ -1551,6 +1553,7 @@ def create_post_comment(
         post_id=post_id,
         author_id=member.user_id,
         content=req.content,
+        parent_id=req.parent_id,
     )
     db.add(comment)
     db.commit()

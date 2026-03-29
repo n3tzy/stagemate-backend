@@ -124,6 +124,7 @@ class NicknameRequest(BaseModel):
 
 class PostCommentRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=500)
+    parent_id: Optional[int] = None
 
     @field_validator('content')
     @classmethod
