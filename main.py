@@ -146,6 +146,21 @@ def _send_push(token: str, title: str, body: str, post_id: int) -> None:
         logging.warning("FCM send failed (token=%s...): %s", token[:10], e)
 
 
+def _send_new_member_push(tokens: list, club_name: str, new_member_name: str) -> None:
+    for token in tokens:
+        try:
+            fb_messaging.send(fb_messaging.Message(
+                notification=fb_messaging.Notification(
+                    title=f"[{club_name}] 새 멤버 가입",
+                    body=f"{new_member_name}님이 가입했습니다.",
+                ),
+                data={"type": "new_member"},
+                token=token,
+            ))
+        except Exception as e:
+            logger.error(f"New member push failed: {e}")
+
+
 def _send_announcement_push(tokens: list, club_name: str, notice_title: str, notice_id: int) -> None:
     """공지사항 생성 시 동아리 전체 멤버에게 FCM 푸시 발송. 논블로킹 백그라운드 태스크."""
     if not _firebase_app or not tokens:
@@ -753,6 +768,7 @@ def create_club(
 @limiter.limit("10/minute")  # 초대코드 브루트포스 방어
 def join_club(
     request: Request,
+    background_tasks: BackgroundTasks,
     req: ClubJoinRequest,
     db: Session = Depends(get_db),
     current_user: db_models.User = Depends(get_current_user)
@@ -786,6 +802,20 @@ def join_club(
     )
     db.add(member)
     db.commit()
+
+    # Push to admins
+    admins = db.query(db_models.ClubMember).filter(
+        db_models.ClubMember.club_id == club.id,
+        db_models.ClubMember.role.in_(["admin", "super_admin"])
+    ).all()
+    admin_tokens = [m.user.fcm_token for m in admins if m.user and m.user.fcm_token]
+    if admin_tokens:
+        background_tasks.add_task(
+            _send_new_member_push,
+            admin_tokens,
+            club.name,
+            current_user.display_name or current_user.email,
+        )
 
     return {
         "message": f"'{club.name}' 동아리에 가입됐습니다! 🎊",
