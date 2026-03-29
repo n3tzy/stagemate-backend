@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     # Access token 만료: 30일 (43200분)
+    # 앱 시작 시 서버 재검증(/auth/me)이 있으므로 탈취 시에도 빠른 무효화 가능.
+    # 진정한 "무기한 로그인"이 필요하다면 refresh token 구조 도입 필요.
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 43200
 
     # 로그인 실패 허용 횟수 (초과 시 계정 잠금)
@@ -31,6 +33,10 @@ class Settings(BaseSettings):
     MAIL_FROM_NAME: str = "StageMate"
     MAIL_SERVER: str = "smtp.gmail.com"
     MAIL_PORT: int = 587
+
+    # ── Apple 인앱결제 (App Store Connect → 앱 → 앱 내 구입 → 공유 암호)
+    # https://appstoreconnect.apple.com → 앱 → 앱 내 구입 탭 → 앱별 공유 암호
+    APPLE_IAP_SHARED_SECRET: str = ""
 
     # ── 카카오 로그인 ──────────────────────────────────────
     KAKAO_REST_API_KEY: str = ""

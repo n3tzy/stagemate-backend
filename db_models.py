@@ -24,6 +24,10 @@ class Club(Base):
     storage_quota_extra_mb = Column(BigInteger, default=0, nullable=False)
     boost_credits          = Column(Integer, default=0, nullable=False)
 
+    # ── SNS 링크 ────────────────────────────────────
+    instagram_url          = Column(String, nullable=True)
+    youtube_url            = Column(String, nullable=True)
+
     members = relationship("ClubMember", back_populates="club")
 
 

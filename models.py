@@ -307,8 +307,10 @@ class ClubProfileUpdate(BaseModel):
     logo_url: Optional[str] = Field(None, max_length=2048)
     banner_url: Optional[str] = Field(None, max_length=2048)
     theme_color: Optional[str] = None  # 7 chars max enforced by regex
+    instagram_url: Optional[str] = Field(None, max_length=2048)
+    youtube_url: Optional[str] = Field(None, max_length=2048)
 
-    @field_validator('logo_url', 'banner_url')
+    @field_validator('logo_url', 'banner_url', 'instagram_url', 'youtube_url')
     @classmethod
     def validate_url(cls, v: Optional[str]) -> Optional[str]:
         if v is None:

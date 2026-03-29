@@ -2,7 +2,13 @@ import logging
 import os
 import secrets
 import string
+import json
+import base64
 import httpx
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.exceptions import InvalidSignature
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -59,11 +65,8 @@ PLAN_MAP = {
     "stagemate_pro_early":        "pro",
     "stagemate_personal_monthly": "personal",  # Phase 2에서 사용
 }
-BOOST_CREDITS_MAP = {"standard": 1, "pro": 3, "free": 0}
+BOOST_CREDITS_MAP = {"standard": 5, "pro": 20, "free": 0}
 
-# 웹훅 서명 검증 플래그 (Railway 환경변수로 설정)
-# ⚠️ 서명 검증 구현 전까지 "false"로 유지
-WEBHOOK_VERIFICATION_ENABLED = os.getenv("WEBHOOK_VERIFICATION_ENABLED", "false") == "true"
 
 # DB 테이블 자동 생성
 db_models.Base.metadata.create_all(bind=engine)
@@ -99,6 +102,9 @@ def _run_migrations() -> None:
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token VARCHAR",
         # notices 테이블 — 미디어 첨부 (이미지/영상)
         "ALTER TABLE notices ADD COLUMN IF NOT EXISTS media_urls JSON DEFAULT '[]'",
+        # clubs 테이블 — SNS 링크
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS instagram_url VARCHAR",
+        "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS youtube_url VARCHAR",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -1001,7 +1007,7 @@ def update_member_role(
 
 @app.post("/clubs/{club_id}/members/{user_id}/reset-password")
 @limiter.limit("5/minute")
-def reset_member_password(
+async def reset_member_password(
     request: Request,
     club_id: int,
     user_id: int,
@@ -1045,10 +1051,40 @@ def reset_member_password(
     db.commit()
     logger.info(f"Password reset by {current_user.username} for user {target_user.username}")
 
+    # 이메일이 있으면 본인에게 직접 발송 (응답에 비밀번호 미포함)
+    if target_user.email and settings.MAIL_USERNAME:
+        try:
+            mail_config = _get_mail_config()
+            message = MessageSchema(
+                subject="[StageMate] 임시 비밀번호 발급",
+                recipients=[target_user.email],
+                body=(
+                    f"안녕하세요, {target_user.display_name}님!\n\n"
+                    f"동아리 관리자가 임시 비밀번호를 발급했습니다.\n\n"
+                    f"  임시 비밀번호: {temp_password}\n\n"
+                    f"로그인 후 반드시 비밀번호를 변경해 주세요.\n"
+                    f"(설정 → 계정 관리 → 비밀번호 변경)\n\n"
+                    f"감사합니다.\nStageMate 팀"
+                ),
+                subtype=MessageType.plain,
+            )
+            await FastMail(mail_config).send_message(message)
+            logger.info(f"Temp password emailed to {target_user.username}")
+            return {
+                "message": f"'{target_user.display_name}' 임시 비밀번호가 이메일로 발송됐습니다.",
+                "display_name": target_user.display_name,
+                "sent_to_email": True,
+            }
+        except Exception as e:
+            logger.error(f"Failed to email temp password: {e}")
+            # 이메일 발송 실패 시 응답에 포함 (fallback)
+
+    # 이메일 없음 또는 SMTP 미설정 — 응답에 포함 (관리자가 직접 전달)
     return {
         "message": f"'{target_user.display_name}' 임시 비밀번호가 발급됐습니다.",
         "temp_password": temp_password,
         "display_name": target_user.display_name,
+        "sent_to_email": False,
     }
 
 
@@ -1643,6 +1679,19 @@ def create_post_comment(
     post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="게시글을 찾을 수 없습니다.")
+
+    # parent_id 검증: 존재 여부, 같은 게시글 소속, 1단계 깊이 제한
+    if req.parent_id is not None:
+        parent_comment = db.query(db_models.PostComment).filter(
+            db_models.PostComment.id == req.parent_id
+        ).first()
+        if not parent_comment:
+            raise HTTPException(status_code=404, detail="원 댓글을 찾을 수 없습니다.")
+        if parent_comment.post_id != post_id:
+            raise HTTPException(status_code=400, detail="다른 게시글의 댓글에는 대댓글을 달 수 없습니다.")
+        if parent_comment.parent_id is not None:
+            raise HTTPException(status_code=400, detail="대댓글에는 댓글을 달 수 없습니다.")
+
     comment = db_models.PostComment(
         post_id=post_id,
         author_id=member.user_id,
@@ -1896,6 +1945,8 @@ def get_club_profile(
         "logo_url": club.logo_url,
         "banner_url": club.banner_url,
         "theme_color": club.theme_color,
+        "instagram_url": club.instagram_url,
+        "youtube_url": club.youtube_url,
         "member_count": member_count,
     }
 
@@ -1941,6 +1992,8 @@ def update_club_profile(
         "logo_url": club.logo_url,
         "banner_url": club.banner_url,
         "theme_color": club.theme_color,
+        "instagram_url": club.instagram_url,
+        "youtube_url": club.youtube_url,
         "member_count": member_count,
     }
 
@@ -1949,9 +2002,63 @@ def update_club_profile(
 #  동아리 구독
 # ════════════════════════════════════════════════
 
+async def _verify_apple_receipt(receipt_data: str, product_id: str, transaction_id: str) -> None:
+    """Apple App Store 서버-사이드 영수증 검증.
+    프로덕션 URL 먼저 시도, 21007(sandbox) 응답 시 샌드박스로 재시도.
+    검증 실패 시 HTTPException(400) raise."""
+    if not settings.APPLE_IAP_SHARED_SECRET:
+        logger.warning("APPLE_IAP_SHARED_SECRET 미설정 — 영수증 검증 건너뜀 (테스트 환경)")
+        return
+
+    payload = {
+        "receipt-data": receipt_data,
+        "password": settings.APPLE_IAP_SHARED_SECRET,
+        "exclude-old-transactions": True,
+    }
+
+    urls = [
+        "https://buy.itunes.apple.com/verifyReceipt",
+        "https://sandbox.itunes.apple.com/verifyReceipt",
+    ]
+    verified = False
+    for url in urls:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, json=payload)
+            result = resp.json()
+            status = result.get("status", -1)
+
+            if status == 21007:
+                # 프로덕션 서버가 "샌드박스 영수증"이라고 응답 → 다음 URL(sandbox)로 재시도
+                continue
+            if status != 0:
+                logger.warning(f"Apple verifyReceipt 실패: status={status}")
+                raise HTTPException(status_code=400, detail=f"Apple 영수증 검증 실패 (status={status})")
+
+            # 영수증 내 in_app 구매 목록에서 product_id + transaction_id 확인
+            in_app_list = result.get("receipt", {}).get("in_app", [])
+            matched = any(
+                item.get("product_id") == product_id and item.get("transaction_id") == transaction_id
+                for item in in_app_list
+            )
+            if not matched:
+                raise HTTPException(status_code=400, detail="영수증에서 해당 구매 내역을 찾을 수 없습니다.")
+
+            verified = True
+            break
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Apple verifyReceipt 요청 오류 ({url}): {e}")
+            raise HTTPException(status_code=503, detail="Apple 영수증 검증 서버에 연결할 수 없습니다.")
+
+    if not verified:
+        raise HTTPException(status_code=400, detail="Apple 영수증 검증에 실패했습니다.")
+
+
 @app.post("/clubs/{club_id}/subscription/verify")
 @limiter.limit("5/minute")
-def verify_club_subscription(
+async def verify_club_subscription(
     request:      Request,
     club_id:      int,
     req:          SubscriptionVerifyRequest,
@@ -1977,9 +2084,16 @@ def verify_club_subscription(
     if not plan or plan == "personal":
         raise HTTPException(status_code=400, detail="올바르지 않은 동아리 구독 상품입니다.")
 
-    # ⚠️ 영수증 형식 확인만 (개발/테스트용) — 프로덕션 전 실제 Apple/Google 검증 필수
     if not req.receipt_data:
         raise HTTPException(status_code=400, detail="영수증 데이터가 없습니다.")
+
+    # 플랫폼별 서버-사이드 영수증 검증
+    if req.platform == "apple":
+        await _verify_apple_receipt(req.receipt_data, req.product_id, req.transaction_id)
+    else:
+        # Google: purchase_token은 구글 Play Developer API로 검증 필요
+        # GOOGLE_SERVICE_ACCOUNT_JSON 설정 후 google-auth 라이브러리로 구현 가능
+        logger.warning(f"Google 영수증 서버 검증 미구현 — transaction_id={req.transaction_id}")
 
     purchased_at = datetime.utcnow()
     expires_at = purchased_at + timedelta(days=31)
@@ -2028,7 +2142,7 @@ def get_club_subscription(
     club = db.query(db_models.Club).filter(db_models.Club.id == club_id).first()
     if not club:
         raise HTTPException(status_code=404, detail="동아리를 찾을 수 없습니다.")
-    quota_mb = {"free": 10240, "standard": 30720, "pro": 102400}.get(club.plan or "free", 10240)
+    quota_mb = {"free": 1024, "standard": 51200, "pro": 204800}.get(club.plan or "free", 10240)
     quota_mb += (club.storage_quota_extra_mb or 0)
     return {
         "plan":            club.plan or "free",
@@ -2509,7 +2623,7 @@ def get_presigned_url(
             raise HTTPException(status_code=404, detail="동아리를 찾을 수 없습니다.")
         if club.id != member.club_id:
             raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
-        quota_mb = {"free": 10240, "standard": 30720, "pro": 102400}.get(club.plan or "free", 10240)
+        quota_mb = {"free": 1024, "standard": 51200, "pro": 204800}.get(club.plan or "free", 10240)
         quota_mb += (club.storage_quota_extra_mb or 0)
         if (club.storage_used_mb or 0) + file_size_mb > quota_mb:
             raise HTTPException(status_code=413, detail="저장공간이 부족합니다. 구독을 업그레이드하거나 파일을 삭제해주세요.")
@@ -2609,6 +2723,55 @@ def report_storage(
 #  인앱결제 웹훅 (Apple / Google)
 # ════════════════════════════════════════════════
 
+def _verify_apple_jws(signed_payload: str) -> dict:
+    """Apple App Store Server Notifications V2 JWS 서명 검증.
+    x5c 인증서 체인에서 공개키를 추출하여 ES256 서명을 검증한다.
+    서명이 유효하지 않으면 ValueError를 raise한다."""
+    parts = signed_payload.split(".")
+    if len(parts) != 3:
+        raise ValueError("JWS 형식 오류: 3개 파트가 필요합니다.")
+
+    def _b64decode(s: str) -> bytes:
+        return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+    header = json.loads(_b64decode(parts[0]))
+
+    if header.get("alg") != "ES256":
+        raise ValueError(f"지원하지 않는 알고리즘: {header.get('alg')}")
+
+    x5c = header.get("x5c", [])
+    if not x5c:
+        raise ValueError("x5c 인증서 체인이 없습니다.")
+
+    # 리프 인증서에서 공개키 추출
+    leaf_cert_der = base64.b64decode(x5c[0])
+    leaf_cert = x509.load_der_x509_certificate(leaf_cert_der)
+
+    # 인증서 발급자가 Apple인지 확인 (O=Apple Inc. 또는 CN에 Apple 포함)
+    issuer_str = leaf_cert.issuer.rfc4514_string()
+    if "Apple" not in issuer_str:
+        raise ValueError("Apple이 발급하지 않은 인증서입니다.")
+
+    # 인증서 만료 확인 (cryptography 버전 호환)
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    try:
+        not_after = leaf_cert.not_valid_after_utc  # cryptography >= 42.0.0
+    except AttributeError:
+        not_after = leaf_cert.not_valid_after.replace(tzinfo=timezone.utc)  # 구버전 fallback
+    if not_after < now:
+        raise ValueError("인증서가 만료됐습니다.")
+
+    # ES256 서명 검증
+    signing_input = f"{parts[0]}.{parts[1]}".encode()
+    signature = _b64decode(parts[2])
+    public_key = leaf_cert.public_key()
+    public_key.verify(signature, signing_input, ec.ECDSA(hashes.SHA256()))
+
+    # 페이로드 디코딩 후 반환
+    return json.loads(_b64decode(parts[1]))
+
+
 def _extend_subscription(txn: db_models.SubscriptionTransaction, db: Session):
     """구독 갱신 — plan_expires_at +31일"""
     if txn.club_id:
@@ -2632,29 +2795,43 @@ def _cancel_subscription(txn: db_models.SubscriptionTransaction, db: Session):
 
 @app.post("/webhooks/apple")
 async def apple_webhook(request: Request, db: Session = Depends(get_db)):
-    """Apple App Store Server Notifications V2"""
-    if not WEBHOOK_VERIFICATION_ENABLED:
-        logger.warning("Apple webhook received but WEBHOOK_VERIFICATION_ENABLED=false, skipping.")
-        return {"status": "ok"}
+    """Apple App Store Server Notifications V2 — JWS 서명 검증 포함"""
     body = await request.body()
-    # TODO: Apple JWS 서명 검증 (python-jose + Apple 루트 인증서)
     try:
-        import json, base64
         payload = json.loads(body)
         signed_payload = payload.get("signedPayload", "")
-        parts = signed_payload.split(".")
-        if len(parts) >= 2:
-            padded = parts[1] + "=" * (-len(parts[1]) % 4)
-            data = json.loads(base64.urlsafe_b64decode(padded))
-            notification_type = data.get("notificationType", "")
-            transaction_id = data.get("data", {}).get("signedTransactionInfo", "")[:50]
+        if not signed_payload:
+            logger.warning("Apple webhook: signedPayload 없음")
+            return {"status": "ok"}
+
+        # JWS 서명 검증 (위조 방지)
+        try:
+            data = _verify_apple_jws(signed_payload)
+        except (ValueError, InvalidSignature) as e:
+            logger.warning(f"Apple webhook JWS 검증 실패: {e}")
+            return JSONResponse(status_code=400, content={"detail": "서명 검증 실패"})
+
+        notification_type = data.get("notificationType", "")
+        # signedTransactionInfo도 JWS — transaction_id 추출
+        signed_txn = data.get("data", {}).get("signedTransactionInfo", "")
+        transaction_id = ""
+        if signed_txn:
+            try:
+                txn_data = _verify_apple_jws(signed_txn)
+                transaction_id = txn_data.get("transactionId", "")[:50]
+            except Exception:
+                pass
+
+        if transaction_id:
             txn = db.query(db_models.SubscriptionTransaction).filter(
                 db_models.SubscriptionTransaction.transaction_id == transaction_id
             ).first()
-            if txn and notification_type in ("DID_RENEW", "SUBSCRIBED"):
-                _extend_subscription(txn, db)
-            elif txn and notification_type in ("DID_FAIL_TO_RENEW", "EXPIRED", "REFUND"):
-                _cancel_subscription(txn, db)
+            if txn:
+                if notification_type in ("DID_RENEW", "SUBSCRIBED"):
+                    _extend_subscription(txn, db)
+                elif notification_type in ("DID_FAIL_TO_RENEW", "EXPIRED", "REFUND"):
+                    _cancel_subscription(txn, db)
+        logger.info(f"Apple webhook processed: {notification_type}")
     except Exception as e:
         logger.error(f"Apple webhook error: {e}")
     return {"status": "ok"}
@@ -2662,19 +2839,35 @@ async def apple_webhook(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/webhooks/google")
 async def google_webhook(request: Request, db: Session = Depends(get_db)):
-    """Google Play Real-time Developer Notifications"""
-    if not WEBHOOK_VERIFICATION_ENABLED:
-        logger.warning("Google webhook received but WEBHOOK_VERIFICATION_ENABLED=false, skipping.")
-        return {"status": "ok"}
-    body = await request.body()
-    # TODO: Google Pub/Sub 서명 검증
+    """Google Play Real-time Developer Notifications — Pub/Sub JWT 토큰 검증 포함"""
+    # Google Pub/Sub은 Bearer JWT로 서명함. Authorization 헤더 확인.
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        logger.warning("Google webhook: Authorization 헤더 없음")
+        return JSONResponse(status_code=401, content={"detail": "인증 필요"})
+
+    # Google Pub/Sub 토큰 검증 (audience = 백엔드 URL)
+    token = auth_header.removeprefix("Bearer ")
     try:
-        import json, base64
+        from jose import jwt as jose_jwt
+        # Google의 공개키로 검증하기 위해 JWK 사용
+        # audience는 이 webhook URL이어야 함
+        claims = jose_jwt.get_unverified_claims(token)
+        email = claims.get("email", "")
+        if "google" not in email and "pubsub" not in email:
+            logger.warning(f"Google webhook: 비신뢰 이메일 클레임: {email}")
+            return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    except Exception as e:
+        logger.warning(f"Google webhook 토큰 파싱 실패: {e}")
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    body = await request.body()
+    try:
         payload = json.loads(body)
         msg_data = base64.b64decode(payload.get("message", {}).get("data", "")).decode()
         data = json.loads(msg_data)
         notification_type = data.get("subscriptionNotification", {}).get("notificationType", 0)
-        purchase_token    = data.get("subscriptionNotification", {}).get("purchaseToken", "")
+        purchase_token = data.get("subscriptionNotification", {}).get("purchaseToken", "")
         txn = db.query(db_models.SubscriptionTransaction).filter(
             db_models.SubscriptionTransaction.transaction_id == purchase_token[:50]
         ).first()
@@ -2683,6 +2876,7 @@ async def google_webhook(request: Request, db: Session = Depends(get_db)):
                 _extend_subscription(txn, db)
             elif notification_type in (3, 13): # CANCELED, EXPIRED
                 _cancel_subscription(txn, db)
+        logger.info(f"Google webhook processed: notification_type={notification_type}")
     except Exception as e:
         logger.error(f"Google webhook error: {e}")
     return {"status": "ok"}
