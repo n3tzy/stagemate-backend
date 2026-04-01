@@ -173,7 +173,7 @@ def _send_announcement_push(tokens: list, club_name: str, notice_title: str, not
     """공지사항 생성 시 동아리 전체 멤버에게 FCM 푸시 발송. 논블로킹 백그라운드 태스크."""
     if not _firebase_app or not tokens:
         return
-    title = f"📢 [{club_name}] 새 공지사항"
+    title = f"[{club_name}] 새 공지사항"
     body = notice_title[:50]
     for token in tokens:
         if not token:
