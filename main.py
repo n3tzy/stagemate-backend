@@ -45,11 +45,13 @@ from models import (
     PerformanceCreateRequest, AudioSubmissionRequest,
     FcmTokenRequest,
     PerformanceArchiveRequest,
+    ChallengeEntryRequest,
 )
 from scheduler import calculate_schedule
 from group_schedule import find_common_slots_from_db
 from room_booking_db import add_booking_db, get_bookings_db, delete_booking_db
 from datetime import datetime, timedelta
+import calendar
 
 # ── 로깅 설정 ──────────────────────────────────────
 logging.basicConfig(
@@ -2791,6 +2793,156 @@ def delete_performance_archive(
     db.delete(a)
     db.commit()
     return {"message": "삭제되었습니다."}
+
+
+# ── 챌린지 ────────────────────────────────────────────────────
+
+def _get_or_create_current_challenge(db: Session) -> db_models.Challenge:
+    """현재 월의 챌린지를 가져오거나 없으면 생성. 이전 월은 모두 비활성화."""
+    current_ym = datetime.utcnow().strftime("%Y-%m")
+
+    # 이전 월 모두 비활성화
+    db.query(db_models.Challenge).filter(
+        db_models.Challenge.year_month < current_ym,
+        db_models.Challenge.is_active == True,
+    ).update({"is_active": False})
+    db.commit()
+
+    challenge = db.query(db_models.Challenge).filter_by(year_month=current_ym).first()
+    if not challenge:
+        challenge = db_models.Challenge(year_month=current_ym)
+        db.add(challenge)
+        db.commit()
+        db.refresh(challenge)
+    return challenge
+
+
+@app.get("/challenge/current")
+def get_current_challenge(
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    """현재 월 챌린지 정보 + 랭킹 반환"""
+    challenge = _get_or_create_current_challenge(db)
+    entries = challenge.entries  # already loaded via relationship
+
+    result = []
+    for entry in entries:
+        likes_count = db.query(db_models.ChallengeEntryLike).filter_by(
+            entry_id=entry.id
+        ).count()
+        my_liked = db.query(db_models.ChallengeEntryLike).filter_by(
+            entry_id=entry.id, user_id=member.user_id
+        ).first() is not None
+        archive = entry.archive
+        result.append({
+            "entry_id": entry.id,
+            "club_id": entry.club_id,
+            "club_name": entry.club.name,
+            "archive_id": archive.id,
+            "archive_title": archive.title,
+            "youtube_url": archive.youtube_url,
+            "likes_count": likes_count,
+            "my_liked": my_liked,
+        })
+
+    # 좋아요 많은 순 정렬
+    result.sort(key=lambda x: x["likes_count"], reverse=True)
+
+    # D-day 계산 (해당 월 말일까지)
+    now = datetime.utcnow()
+    last_day = calendar.monthrange(now.year, now.month)[1]
+    end_of_month = datetime(now.year, now.month, last_day, 23, 59, 59)
+    days_left = (end_of_month - now).days
+
+    return {
+        "challenge_id": challenge.id,
+        "year_month": challenge.year_month,
+        "is_active": challenge.is_active,
+        "days_left": days_left,
+        "entry_count": len(result),
+        "entries": result,
+        "my_club_id": member.club_id,
+    }
+
+
+@app.post("/challenge/entries")
+def submit_challenge_entry(
+    req: ChallengeEntryRequest,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_admin),
+):
+    """현재 월 챌린지에 동아리 대표 공연 제출"""
+    challenge = _get_or_create_current_challenge(db)
+
+    if not challenge.is_active:
+        raise HTTPException(status_code=400, detail="종료된 챌린지입니다.")
+
+    # 이미 제출한 경우 확인
+    existing = db.query(db_models.ChallengeEntry).filter_by(
+        challenge_id=challenge.id, club_id=member.club_id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="이미 이번 달 챌린지에 참가했어요. 기존 제출을 취소하고 다시 제출하세요.")
+
+    # 해당 아카이브가 우리 동아리 것인지 확인
+    archive = db.query(db_models.PerformanceArchive).filter_by(
+        id=req.archive_id, club_id=member.club_id
+    ).first()
+    if not archive:
+        raise HTTPException(status_code=404, detail="공연 기록을 찾을 수 없습니다.")
+
+    entry = db_models.ChallengeEntry(
+        challenge_id=challenge.id,
+        club_id=member.club_id,
+        archive_id=req.archive_id,
+    )
+    db.add(entry)
+    db.commit()
+    return {"message": "챌린지에 참가되었습니다!", "entry_id": entry.id}
+
+
+@app.delete("/challenge/entries/mine")
+def withdraw_challenge_entry(
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_admin),
+):
+    """현재 월 챌린지 참가 취소"""
+    challenge = _get_or_create_current_challenge(db)
+    entry = db.query(db_models.ChallengeEntry).filter_by(
+        challenge_id=challenge.id, club_id=member.club_id
+    ).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="참가 내역이 없습니다.")
+    db.delete(entry)
+    db.commit()
+    return {"message": "참가가 취소되었습니다."}
+
+
+@app.post("/challenge/entries/{entry_id}/like")
+def toggle_challenge_like(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_any_member),
+):
+    entry = db.query(db_models.ChallengeEntry).get(entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="참가 항목을 찾을 수 없습니다.")
+
+    challenge = db.query(db_models.Challenge).get(entry.challenge_id)
+    if not challenge or not challenge.is_active:
+        raise HTTPException(status_code=400, detail="투표 기간이 종료되었습니다.")
+
+    existing = db.query(db_models.ChallengeEntryLike).filter_by(
+        entry_id=entry_id, user_id=member.user_id
+    ).first()
+    if existing:
+        db.delete(existing)
+        db.commit()
+        return {"liked": False}
+    db.add(db_models.ChallengeEntryLike(entry_id=entry_id, user_id=member.user_id))
+    db.commit()
+    return {"liked": True}
 
 
 # ════════════════════════════════════════════════
