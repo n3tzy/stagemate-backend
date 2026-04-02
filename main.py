@@ -2790,6 +2790,30 @@ def toggle_archive_like(
     return {"liked": True}
 
 
+@app.patch("/clubs/{club_id}/performance-archives/{archive_id}")
+def update_performance_archive(
+    club_id: int,
+    archive_id: int,
+    req: PerformanceArchiveRequest,
+    db: Session = Depends(get_db),
+    member: db_models.ClubMember = Depends(require_admin),
+):
+    if member.club_id != club_id:
+        raise HTTPException(status_code=403, detail="다른 동아리의 기록을 수정할 수 없습니다.")
+    archive = db.query(db_models.PerformanceArchive).filter(
+        db_models.PerformanceArchive.id == archive_id,
+        db_models.PerformanceArchive.club_id == club_id,
+    ).first()
+    if not archive:
+        raise HTTPException(status_code=404, detail="공연 기록을 찾을 수 없습니다.")
+    archive.title = req.title
+    archive.performance_date = req.performance_date
+    archive.description = req.description
+    archive.youtube_url = req.youtube_url
+    db.commit()
+    return {"message": "수정되었습니다."}
+
+
 @app.delete("/clubs/{club_id}/performance-archives/{archive_id}")
 def delete_performance_archive(
     club_id: int,
