@@ -105,6 +105,58 @@ def _run_migrations() -> None:
         # clubs 테이블 — SNS 링크
         "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS instagram_url VARCHAR",
         "ALTER TABLE clubs ADD COLUMN IF NOT EXISTS youtube_url VARCHAR",
+        # --- 공연 플랫폼 마이그레이션 ---
+        """
+CREATE TABLE IF NOT EXISTS performance_archives (
+    id               SERIAL PRIMARY KEY,
+    club_id          INTEGER NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+    title            VARCHAR NOT NULL,
+    description      TEXT,
+    performance_date VARCHAR(10) NOT NULL,
+    youtube_url      VARCHAR(500),
+    native_video_url VARCHAR,
+    view_count       INTEGER NOT NULL DEFAULT 0,
+    created_at       TIMESTAMP DEFAULT NOW()
+)
+""",
+        """
+CREATE TABLE IF NOT EXISTS performance_archive_likes (
+    id         SERIAL PRIMARY KEY,
+    archive_id INTEGER NOT NULL REFERENCES performance_archives(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT uq_archive_like UNIQUE (archive_id, user_id)
+)
+""",
+        """
+CREATE TABLE IF NOT EXISTS challenges (
+    id         SERIAL PRIMARY KEY,
+    year_month VARCHAR(7) NOT NULL,
+    is_active  BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT uq_challenge_month UNIQUE (year_month)
+)
+""",
+        """
+CREATE TABLE IF NOT EXISTS challenge_entries (
+    id           SERIAL PRIMARY KEY,
+    challenge_id INTEGER NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+    club_id      INTEGER NOT NULL REFERENCES clubs(id) ON DELETE CASCADE,
+    archive_id   INTEGER NOT NULL REFERENCES performance_archives(id) ON DELETE CASCADE,
+    created_at   TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT uq_challenge_entry UNIQUE (challenge_id, club_id)
+)
+""",
+        """
+CREATE TABLE IF NOT EXISTS challenge_entry_likes (
+    id         SERIAL PRIMARY KEY,
+    entry_id   INTEGER NOT NULL REFERENCES challenge_entries(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT uq_entry_like UNIQUE (entry_id, user_id)
+)
+""",
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS youtube_url VARCHAR(500)",
     ]
     with engine.connect() as conn:
         for sql in migrations:
