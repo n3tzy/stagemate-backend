@@ -2930,11 +2930,11 @@ def toggle_challenge_like(
     db: Session = Depends(get_db),
     member: db_models.ClubMember = Depends(require_any_member),
 ):
-    entry = db.query(db_models.ChallengeEntry).get(entry_id)
+    entry = db.get(db_models.ChallengeEntry, entry_id)
     if not entry:
         raise HTTPException(status_code=404, detail="참가 항목을 찾을 수 없습니다.")
 
-    challenge = db.query(db_models.Challenge).get(entry.challenge_id)
+    challenge = db.get(db_models.Challenge, entry.challenge_id)
     if not challenge or not challenge.is_active:
         raise HTTPException(status_code=400, detail="투표 기간이 종료되었습니다.")
 
