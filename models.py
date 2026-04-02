@@ -147,6 +147,7 @@ class PostCommentRequest(BaseModel):
 
 class PostEditRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=2000)
+    media_urls: list[str] = Field(default_factory=list, max_length=5)
 
     @field_validator('content')
     @classmethod

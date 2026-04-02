@@ -1295,6 +1295,7 @@ def update_notice(
         raise HTTPException(status_code=403, detail="본인이 작성한 공지사항만 수정할 수 있습니다.")
     notice.title = req.title
     notice.content = req.content
+    notice.media_urls = req.media_urls
     db.commit()
     return {"message": "수정되었습니다."}
 
@@ -2082,6 +2083,7 @@ def update_post(
     if post.author_id != member.user_id:
         raise HTTPException(status_code=403, detail="수정 권한이 없습니다.")
     post.content = req.content
+    post.media_urls = req.media_urls
     db.commit()
     return {"message": "수정됐습니다."}
 
