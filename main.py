@@ -1567,7 +1567,22 @@ def create_booking(
     db: Session = Depends(get_db),
     member: db_models.ClubMember = Depends(require_any_member)
 ):
-    return add_booking_db(booking, member.user_id, member.club_id, db)
+    from datetime import date as _date
+    try:
+        booking_date = _date.fromisoformat(booking.date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="날짜 형식이 올바르지 않습니다. (YYYY-MM-DD)")
+    if booking_date < _date.today():
+        raise HTTPException(status_code=400, detail="과거 날짜에는 예약할 수 없습니다.")
+
+    result = add_booking_db(booking, member.user_id, member.club_id, db)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=409,
+            detail=result.get("message", "예약 충돌") + " — " +
+                   ", ".join(result.get("conflicts", []))
+        )
+    return result
 
 
 @app.get("/booking/{date}")
