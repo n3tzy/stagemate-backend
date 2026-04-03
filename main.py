@@ -293,8 +293,17 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── CORS 설정 ─────────────────────────────────────────
-# 개발: 모든 로컬 출처 허용 / 프로덕션: 환경변수 지정 origin만 허용
-_origins = ["*"] if not settings.IS_PRODUCTION else settings.ALLOWED_ORIGINS.split(",")
+# 개발: 로컬호스트 명시적 허용 / 프로덕션: 환경변수 지정 origin만 허용
+# 보안: "*" 와일드카드 금지 — CSRF 및 credential 탈취 방어
+_DEV_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+]
+_origins = _DEV_ORIGINS if not settings.IS_PRODUCTION else [
+    o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
@@ -1185,10 +1194,11 @@ async def reset_member_password(
             logger.error(f"Failed to email temp password: {e}")
             # 이메일 발송 실패 시 응답에 포함 (fallback)
 
-    # 이메일 없음 또는 SMTP 미설정 — 응답에 포함 (관리자가 직접 전달)
+    # 이메일 없음 또는 SMTP 미설정 — 보안상 API 응답에 비밀번호 미포함
+    # 관리자는 앱 내 "비밀번호 찾기" 플로우를 통해 임시 비밀번호를 안내해야 함
+    # [SECURITY] temp_password를 응답 body에 포함하면 Railway 로그 및 프록시에 노출됨
     return {
-        "message": f"'{target_user.display_name}' 임시 비밀번호가 발급됐습니다.",
-        "temp_password": temp_password,
+        "message": f"'{target_user.display_name}' 임시 비밀번호가 발급됐습니다. 이메일 미등록 계정이므로 멤버에게 직접 비밀번호 재설정을 안내해 주세요.",
         "display_name": target_user.display_name,
         "sent_to_email": False,
     }
@@ -2067,8 +2077,11 @@ def delete_post_comment(
     if not comment:
         raise HTTPException(status_code=404, detail="댓글을 찾을 수 없습니다.")
     # 해당 댓글이 속한 게시글의 클럽 경계 확인
+    # [SECURITY] post가 None이면 데이터 무결성 오류 — 삭제 허용 금지
     post = db.query(db_models.Post).filter(db_models.Post.id == post_id).first()
-    if post and not post.is_global and post.club_id != member.club_id:
+    if not post:
+        raise HTTPException(status_code=404, detail="게시글을 찾을 수 없습니다.")
+    if not post.is_global and post.club_id != member.club_id:
         raise HTTPException(status_code=403, detail="삭제 권한이 없습니다.")
     if comment.author_id != member.user_id:
         raise HTTPException(status_code=403, detail="삭제 권한이 없습니다.")
